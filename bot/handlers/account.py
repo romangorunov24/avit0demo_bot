@@ -1,157 +1,191 @@
-import io
 import json
+import logging
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
-from bot.keyboards import account_menu_kb, cancel_kb
+from bot.keyboards import account_menu_kb, cancel_kb, main_menu_kb
 from bot.states import AccountStates
-from config import settings
-from database import models
-from services.spintax import render_spintax
-from utils.helpers import parse_cookies_json
+from database import db
+from services.avito_messenger import AvitoMessenger, normalize_cookies
 
+logger = logging.getLogger(__name__)
 router = Router()
 
 
-async def _render_account_screen() -> tuple[str, dict | None, bool, bool]:
-    account = await models.get_account()
-    auto_reply = await models.get_setting("auto_reply_enabled", "1") == "1"
-    night_mode = await models.get_setting("night_mode", "0") == "1"
-    spintax = await models.get_setting("spintax_template")
-    limit = await models.get_setting("hourly_limit", "15")
+def _format_account_text(user_data: dict | None) -> str:
+    cookies_raw = (user_data or {}).get("avito_cookies")
+    template = (user_data or {}).get("default_template") or "Здравствуйте! Объявление ещё актуально?"
+    cookies = normalize_cookies(cookies_raw or "")
 
-    if settings.AVITO_ACCESS_TOKEN and settings.AVITO_USER_ID:
-        status = "🟢 Официальный API подключен (.env)"
-    elif account and account["is_valid"]:
-        status = f"🟢 Активна (обновлена: {account['updated_at']})"
-    elif account:
-        status = "🔴 Недействительна — загрузите свежие cookies"
+    if cookies:
+        status = f"🟢 <b>Подключён</b> (ключей: <code>{', '.join(cookies.keys())}</code>)"
     else:
-        status = "⚪ Не привязана"
+        status = "⚪️ <b>Не привязан</b> (парсинг работает, автоотклик выключен)"
 
-    example = render_spintax(spintax, title="iPhone 13 Pro Max 256GB", price=42000)
-    text = (
-        "<b>👤 Настройки аккаунта Avito и Автоотклика</b>\n\n"
-        f"• <b>Сессия Avito:</b> {status}\n"
-        f"• <b>Лимит антибана:</b> не более {limit} сообщ./час\n"
-        f"• <b>Текущий шаблон:</b>\n<code>{spintax}</code>\n\n"
-        f"• <b>Пример сообщения:</b>\n<i>«{example}»</i>"
+    return (
+        "👤 <b>Управление аккаунтом Avito</b>\n\n"
+        f"Статус: {status}\n"
+        f"Шаблон по умолчанию:\n<i>«{template}»</i>\n\n"
+        "Выберите удобный способ подключения ниже:"
     )
-    return text, account, auto_reply, night_mode
 
 
-@router.callback_query(F.data == "account:menu")
-async def cb_account_menu(callback: CallbackQuery, state: FSMContext) -> None:
+@router.message(F.text == "👤 Мой Avito")
+async def show_account_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
-    text, acc, ar, nm = await _render_account_screen()
-    await callback.message.edit_text(
-        text, reply_markup=account_menu_kb(acc, ar, nm), parse_mode="HTML"
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "account:toggle_autoreply")
-async def cb_toggle_autoreply(callback: CallbackQuery) -> None:
-    cur = await models.get_setting("auto_reply_enabled", "1")
-    await models.set_setting("auto_reply_enabled", "0" if cur == "1" else "1")
-    text, acc, ar, nm = await _render_account_screen()
-    await callback.message.edit_text(text, reply_markup=account_menu_kb(acc, ar, nm), parse_mode="HTML")
-    await callback.answer("Настройка автоответа изменена")
-
-
-@router.callback_query(F.data == "account:toggle_night")
-async def cb_toggle_night(callback: CallbackQuery) -> None:
-    cur = await models.get_setting("night_mode", "0")
-    await models.set_setting("night_mode", "0" if cur == "1" else "1")
-    text, acc, ar, nm = await _render_account_screen()
-    await callback.message.edit_text(text, reply_markup=account_menu_kb(acc, ar, nm), parse_mode="HTML")
-    await callback.answer("Ночной режим переключен")
-
-
-@router.callback_query(F.data == "account:cookies")
-async def cb_account_cookies(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AccountStates.waiting_cookies)
-    await callback.message.edit_text(
-        "🍪 <b>Привязка аккаунта Avito</b>\n\n"
-        "1. Авторизуйтесь на <code>avito.ru</code> в браузере.\n"
-        "2. Откройте расширение <b>Cookie-Editor</b> → нажмите <b>Export → JSON</b>.\n"
-        "3. Отправьте скопированный текст сюда сообщением или прикрепите <code>.json</code> файлом:",
-        reply_markup=cancel_kb("account:menu"),
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@router.message(AccountStates.waiting_cookies)
-async def msg_account_cookies(message: Message, state: FSMContext) -> None:
-    raw_json = ""
-    if message.document:
-        buf = io.BytesIO()
-        await message.bot.download(message.document, destination=buf)
-        raw_json = buf.getvalue().decode("utf-8", errors="ignore")
-    elif message.text:
-        raw_json = message.text.strip()
-
-    try:
-        cookies_dict = parse_cookies_json(raw_json)
-        await models.save_cookies(json.dumps(cookies_dict, ensure_ascii=False), is_valid=1)
-    except Exception as e:
-        await message.answer(f"❌ Ошибка чтения cookies: {e}\nПроверьте формат JSON и отправьте снова:")
-        return
-
-    await state.clear()
-    text, acc, ar, nm = await _render_account_screen()
+    user_data = await db.get_user_settings(message.from_user.id)
+    has_acc = bool(normalize_cookies((user_data or {}).get("avito_cookies") or ""))
     await message.answer(
-        f"✅ Загружено {len(cookies_dict)} cookies! Сессия сохранена.\n\n" + text,
-        reply_markup=account_menu_kb(acc, ar, nm),
+        _format_account_text(user_data),
         parse_mode="HTML",
+        reply_markup=account_menu_kb(has_acc),
     )
 
 
-@router.callback_query(F.data == "account:spintax")
-async def cb_account_spintax(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AccountStates.waiting_spintax)
-    await callback.message.edit_text(
-        "✍️ <b>Настройка шаблона первого сообщения</b>\n\n"
-        "Используйте конструкции <code>{вариант 1|вариант 2|вариант 3}</code> для рандомизации текста (защита от спам-фильтра) "
-        "и переменные <code>{title}</code> (название товара) и <code>{price}</code> (цена).\n\n"
-        "Отправьте новый шаблон:",
-        reply_markup=cancel_kb("account:menu"),
+@router.callback_query(F.data == "acc_menu_open")
+async def open_account_from_card(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    user_data = await db.get_user_settings(callback.from_user.id)
+    has_acc = bool(normalize_cookies((user_data or {}).get("avito_cookies") or ""))
+    await callback.message.answer(
+        _format_account_text(user_data),
         parse_mode="HTML",
+        reply_markup=account_menu_kb(has_acc),
     )
     await callback.answer()
 
 
-@router.message(AccountStates.waiting_spintax)
-async def msg_account_spintax(message: Message, state: FSMContext) -> None:
-    tpl = (message.text or "").strip()
-    if len(tpl) < 5:
-        await message.answer("Шаблон слишком короткий. Введите нормальный текст:")
-        return
-    await models.set_setting("spintax_template", tpl)
+@router.callback_query(F.data == "cancel_fsm")
+async def cancel_fsm_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    text, acc, ar, nm = await _render_account_screen()
-    await message.answer(text, reply_markup=account_menu_kb(acc, ar, nm), parse_mode="HTML")
+    await callback.message.edit_text("Действие отменено.")
+    await callback.answer()
 
 
-@router.callback_query(F.data == "account:limit")
-async def cb_account_limit(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AccountStates.waiting_hourly_limit)
-    await callback.message.edit_text(
-        "⏱ Введите максимальное количество автоматических сообщений в час (рекомендуется <code>10–20</code>):",
-        reply_markup=cancel_kb("account:menu"),
+@router.callback_query(F.data == "acc_connect_pc")
+async def connect_pc_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AccountStates.waiting_cookies_pc)
+    text = (
+        "💻 <b>Подключение через компьютер (3 шага)</b>\n\n"
+        "1. Откройте <b>avito.ru</b> в браузере (Chrome / Яндекс) и войдите в свой аккаунт.\n"
+        "2. Установите бесплатное расширение <b>Cookie-Editor</b>, нажмите на него на странице Авито → "
+        "<b>Export → Export as JSON</b>.\n"
+        "3. Сохраните текст в файл <code>cookies.json</code> (через Блокнот) и <b>отправьте этот файл сюда документом</b> "
+        "(или вставьте текстом — я сам вырежу всё лишнее).\n\n"
+        "⚠️ <i>После экспорта не нажимайте «Выйти» на сайте Авито, просто закройте вкладку.</i>"
+    )
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=cancel_kb())
+    await callback.answer()
+
+
+@router.message(AccountStates.waiting_cookies_pc)
+async def process_pc_cookies(message: Message, state: FSMContext) -> None:
+    raw_text = ""
+
+    # Поддержка загрузки файла cookies.json документом (решает проблему лимита 4096 символов)
+    if message.document:
+        if message.document.file_size and message.document.file_size > 512 * 1024:
+            await message.answer("❌ Файл слишком большой (максимум 512 КБ). Отправьте файл cookies.json.")
+            return
+        file = await message.bot.get_file(message.document.file_id)
+        downloaded = await message.bot.download_file(file.file_path)
+        raw_text = downloaded.read().decode("utf-8", errors="ignore")
+    elif message.text:
+        raw_text = message.text
+    else:
+        await message.answer("Отправьте файл <code>cookies.json</code> или вставьте текст JSON.", parse_mode="HTML")
+        return
+
+    cleaned = normalize_cookies(raw_text)
+    if not cleaned or ("sessid" not in cleaned and "u" not in cleaned):
+        await message.answer(
+            "❌ Не удалось найти авторизационные ключи Авито (<code>sessid</code> и <code>u</code>).\n"
+            "Убедитесь, что вы экспортировали cookies именно со страницы <b>avito.ru</b> после входа в аккаунт, "
+            "и отправьте файл <code>cookies.json</code> повторно:",
+            parse_mode="HTML",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    compact_json = json.dumps(cleaned, ensure_ascii=False)
+    await db.save_user_cookies(message.from_user.id, compact_json)
+    await state.clear()
+
+    wait_msg = await message.answer("⏳ Проверяю сессию Avito через прокси...")
+    messenger = AvitoMessenger()
+    ok, info = await messenger.check_session(compact_json)
+
+    prefix = "✅" if ok else "⚠️"
+    await wait_msg.edit_text(
+        f"{prefix} <b>Готово!</b> {info}\n"
+        f"Сохранены компактные ключи: <code>{', '.join(cleaned.keys())}</code>",
         parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "acc_connect_mobile")
+async def connect_mobile_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AccountStates.waiting_mobile_session)
+    text = (
+        "📱 <b>Подключение с телефона (без компьютера)</b>\n\n"
+        "На телефоне (Android или iPhone) удобнее всего подключить аккаунт через мобильный браузер с поддержкой расширений:\n\n"
+        "1. Установите браузер <b>Kiwi Browser</b> (Android) или <b>Orion Browser</b> (iPhone).\n"
+        "2. Войдите в нём на сайт <b>avito.ru</b>.\n"
+        "3. Установите расширение <b>Cookie-Editor</b>, нажмите <b>Export</b> и вставьте скопированный текст прямо в этот чат "
+        "(или отправьте только строку вида <code>sessid=...; u=...; v=...</code>).\n\n"
+        "Отправьте данные сессии в ответном сообщении:"
+    )
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=cancel_kb())
+    await callback.answer()
+
+
+@router.message(AccountStates.waiting_mobile_session)
+async def process_mobile_session(message: Message, state: FSMContext) -> None:
+    if not message.text and not message.document:
+        await message.answer("Отправьте текст сессии или файл cookies.json.", reply_markup=cancel_kb())
+        return
+    # Используем тот же универсальный обработчик с автоочисткой
+    await process_pc_cookies(message, state)
+
+
+@router.callback_query(F.data == "acc_check")
+async def check_account_handler(callback: CallbackQuery) -> None:
+    user_data = await db.get_user_settings(callback.from_user.id)
+    cookies_raw = (user_data or {}).get("avito_cookies")
+    messenger = AvitoMessenger()
+    ok, info = await messenger.check_session(cookies_raw)
+    await callback.answer(info[:190], show_alert=True)
+
+
+@router.callback_query(F.data == "acc_disconnect")
+async def disconnect_account_handler(callback: CallbackQuery) -> None:
+    await db.save_user_cookies(callback.from_user.id, None)
+    user_data = await db.get_user_settings(callback.from_user.id)
+    await callback.message.edit_text(
+        _format_account_text(user_data),
+        parse_mode="HTML",
+        reply_markup=account_menu_kb(False),
+    )
+    await callback.answer("Аккаунт Avito отвязан")
+
+
+@router.callback_query(F.data == "acc_set_template")
+async def set_template_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AccountStates.waiting_default_template)
+    await callback.message.answer(
+        "✏️ Введите текст сообщения по умолчанию, который бот будет отправлять продавцам.\n"
+        "Поддерживается спинтакс: <code>{Здравствуйте|Добрый день}! {Актуально|Ещё продаёте}?</code>",
+        parse_mode="HTML",
+        reply_markup=cancel_kb(),
     )
     await callback.answer()
 
 
-@router.message(AccountStates.waiting_hourly_limit)
-async def msg_account_limit(message: Message, state: FSMContext) -> None:
-    val = (message.text or "").strip()
-    if not val.isdigit() or int(val) < 1 or int(val) > 100:
-        await message.answer("Введите число от 1 до 100:")
+@router.message(AccountStates.waiting_default_template)
+async def save_template_handler(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        await message.answer("Отправьте текстовое сообщение.", reply_markup=cancel_kb())
         return
-    await models.set_setting("hourly_limit", val)
+    await db.save_default_template(message.from_user.id, message.text.strip())
     await state.clear()
-    text, acc, ar, nm = await _render_account_screen()
-    await message.answer(text, reply_markup=account_menu_kb(acc, ar, nm), parse_mode="HTML")
+    await message.answer("✅ Шаблон автоотклика обновлён!", reply_markup=main_menu_kb())
