@@ -1,3 +1,4 @@
+import asyncio
 import json
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -54,14 +55,15 @@ async def cancel_fsm_handler(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.callback_query(F.data == "acc_connect_pc")
 async def connect_pc_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     await state.set_state(AccountStates.waiting_cookies_pc)
     text = (
         "💻 <b>Подключение через компьютер (3 шага)</b>\n\n"
         "1. Откройте <b>avito.ru</b> в браузере (Chrome / Яндекс) и войдите в аккаунт.\n"
         "2. Установите расширение <b>Cookie-Editor</b>, нажмите на него на странице Авито → "
         "<b>Export → Export as JSON</b>.\n"
-        "3. Сохраните текст в файл <code>cookies.json</code> и <b>отправьте этот файл сюда документом</b> "
-        "(или вставьте текстом - я сам вырежу всё лишнее).\n\n"
+        "3. Вставьте скопированный текст прямо в этот чат (я сам склею все части и вырежу лишнее) "
+        "или отправьте файлом <code>cookies.json</code>.\n\n"
         "⚠️ <i>После экспорта не нажимайте «Выйти» на сайте Авито, просто закройте вкладку.</i>"
     )
     await callback.message.answer(text, parse_mode="HTML", reply_markup=cancel_kb())
@@ -86,16 +88,33 @@ async def process_pc_cookies(message: Message, state: FSMContext) -> None:
         return
 
     cleaned = normalize_cookies(raw_text)
-    if not cleaned or ("sessid" not in cleaned and "u" not in cleaned):
+
+    # Накапливаем ключи из всех частей, если Telegram разрезал длинное сообщение на несколько кусков
+    data = await state.get_data()
+    seq = data.get("cookie_seq", 0) + 1
+    accumulated = dict(data.get("acc_cookies", {}))
+    accumulated.update(cleaned)
+    await state.update_data(cookie_seq=seq, acc_cookies=accumulated)
+
+    if not message.document:
+        await asyncio.sleep(1.2)
+        latest_data = await state.get_data()
+        if latest_data.get("cookie_seq") != seq:
+            return
+        accumulated = dict(latest_data.get("acc_cookies", {}))
+
+    if not accumulated or ("sessid" not in accumulated and "u" not in accumulated):
+        await state.update_data(acc_cookies={})
         await message.answer(
             "❌ Не удалось найти ключи Авито (<code>sessid</code> и <code>u</code>).\n"
-            "Экспортируйте cookies именно со страницы <b>avito.ru</b> после входа в аккаунт и отправьте файл <code>cookies.json</code>:",
+            "Убедитесь, что вы экспортировали cookies со страницы <b>avito.ru</b> после входа в аккаунт, "
+            "и отправьте их повторно:",
             parse_mode="HTML",
             reply_markup=cancel_kb(),
         )
         return
 
-    compact_json = json.dumps(cleaned, ensure_ascii=False)
+    compact_json = json.dumps(accumulated, ensure_ascii=False)
     await db.save_user_cookies(message.from_user.id, compact_json)
     await state.clear()
 
@@ -106,13 +125,14 @@ async def process_pc_cookies(message: Message, state: FSMContext) -> None:
     prefix = "✅" if ok else "⚠️"
     await wait_msg.edit_text(
         f"{prefix} <b>Готово!</b> {info}\n"
-        f"Сохранены компактные ключи: <code>{', '.join(cleaned.keys())}</code>",
+        f"Сохранены компактные ключи: <code>{', '.join(accumulated.keys())}</code>",
         parse_mode="HTML",
     )
 
 
 @router.callback_query(F.data == "acc_connect_mobile")
 async def connect_mobile_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     await state.set_state(AccountStates.waiting_mobile_session)
     text = (
         "📱 <b>Подключение с телефона (без компьютера)</b>\n\n"
