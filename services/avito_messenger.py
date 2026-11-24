@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 def normalize_cookies(raw_cookies: str | list[dict[str, Any]] | dict[str, Any]) -> dict[str, str]:
-    important_keys = {"u", "v", "sessid", "srv_id", "ft", "auth", "f"}
+    important_keys = {"u", "v", "sessid", "srv_id", "ft", "auth", "f", "sx", "buyer_location_id"}
     result: dict[str, str] = {}
 
     if isinstance(raw_cookies, str):
@@ -94,11 +94,15 @@ class AvitoMessenger:
                     name = data.get("name") or data.get("user", {}).get("name") or "Профиль Avito"
                     return True, f"Аккаунт подключён: {name}"
                 if resp.status_code == 429:
-                    return False, "IP прокси упёрся в лимит Авито (HTTP 429). Смените IP на прокси и проверьте снова."
-                if resp.status_code in (401, 403):
-                    return False, "Сессия недействительна или устарела (401/403). Войдите в Avito заново."
-                if "sessid" in cookies and "u" in cookies:
-                    return True, f"Ключевые cookies сохранены (ответ Avito: HTTP {resp.status_code})."
+                    return False, "IP прокси упёрся в лимит Авито (HTTP 429). Смените IP прокси."
+                if resp.status_code == 403:
+                    ctype = resp.headers.get("content-type", "").lower()
+                    body = resp.text.lower()
+                    if "text/html" in ctype or "доступ ограничен" in body or "проблема с ip" in body:
+                        return False, "Прокси-IP заблокирован фаерволом Авито (HTTP 403 WAF). Смените прокси в PROXY_URL."
+                    return False, "Сессия отклонена Авито (HTTP 403). Перепривяжите аккаунт."
+                if resp.status_code == 401:
+                    return False, "Сессия устарела (HTTP 401). Войдите в Avito заново и обновите cookies."
                 return False, f"Avito вернул статус {resp.status_code} при проверке профиля."
         except Exception as e:
             logger.warning("Ошибка проверки сессии Avito: %s", e)
@@ -158,8 +162,11 @@ class AvitoMessenger:
                     resp = await session.post(url, json=payload, cookies=cookies, headers=headers)
                     last_status = resp.status_code
 
-                    if resp.status_code in (401, 403):
-                        return False, "Сессия Avito истекла (401/403). Перепривяжите аккаунт."
+                    if resp.status_code == 401:
+                        return False, "Сессия Avito истекла (401). Перепривяжите аккаунт."
+
+                    if resp.status_code == 403:
+                        return False, "Доступ запрещён (403 WAF по IP прокси или устаревшая сессия)."
 
                     if resp.status_code == 429:
                         return False, "Лимит запросов Авито (HTTP 429) на IP прокси."
