@@ -210,3 +210,23 @@ class AvitoMessenger:
                     logger.debug("Ошибка отправки текста в %s: %s", send_url, e)
 
             return False, f"Чат открыт, но текст не доставлен (HTTP {last_status or 'ERR'})."
+async def send_first_message(
+    item_id: int | str,
+    text: str,
+    item_url: str | None = None,
+    cookies_json: str | None = None,
+    cookies: str | None = None,
+    access_token: str | None = None,
+    **kwargs: Any,
+) -> tuple[bool, str]:
+    """Совместимая функция-обёртка для вызова из bot/handlers/actions.py."""
+    messenger = AvitoMessenger()
+    target_url = item_url or f"https://www.avito.ru/items/{item_id}"
+    raw_cookies = cookies_json or cookies
+    return await messenger.send_message(
+        item_id=item_id,
+        item_url=target_url,
+        text=text,
+        cookies_json=raw_cookies,
+        access_token=access_token,
+    )
