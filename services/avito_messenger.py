@@ -1,131 +1,212 @@
-import asyncio
 import json
 import logging
-import random
-from datetime import datetime
-import aiohttp
+from typing import Any
+from curl_cffi.requests import AsyncSession
 from config import settings
-from database import models
-
-try:
-    from curl_cffi.requests import AsyncSession as CurlAsyncSession
-    HAS_CURL_CFFI = True
-except ImportError:
-    HAS_CURL_CFFI = False
 
 logger = logging.getLogger(__name__)
 
 
-def _is_night_time() -> bool:
-    hour = datetime.now().hour
-    return 0 <= hour < 7
+def normalize_cookies(raw_cookies: str | list[dict[str, Any]]) -> dict[str, str]:
+    """Извлекает только рабочие куки Авито из JSON-списка, словаря или строки Cookie."""
+    important_keys = {"u", "v", "sessid", "srv_id", "ft", "auth", "f"}
+    result: dict[str, str] = {}
+
+    if isinstance(raw_cookies, str):
+        text = raw_cookies.strip()
+        if text.startswith("[") or text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+                return normalize_cookies(parsed)
+            except json.JSONDecodeError:
+                pass
+        # Поддержка вставки строкой вида "u=...; v=...; sessid=..."
+        for part in text.split(";"):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                if k in important_keys and v:
+                    result[k] = v
+        return result
+
+    if isinstance(raw_cookies, list):
+        for item in raw_cookies:
+            if not isinstance(item, dict):
+                continue
+            domain = str(item.get("domain", ""))
+            name = str(item.get("name", "")).strip()
+            value = str(item.get("value", "")).strip()
+            if ("avito.ru" in domain or not domain) and name in important_keys and value:
+                result[name] = value
+        return result
+
+    if isinstance(raw_cookies, dict):
+        for k, v in raw_cookies.items():
+            if k in important_keys and v:
+                result[str(k)] = str(v).strip()
+        return result
+
+    return result
 
 
-async def send_first_message(item_id: str, text: str, seller_id: str = "unknown") -> tuple[bool, str]:
-    """
-    Отправляет сообщение продавцу с соблюдением лимитов антибана.
-    Поддерживает:
-    1. Официальный API Авито (если заданы AVITO_USER_ID и AVITO_ACCESS_TOKEN).
-    2. Пользовательскую сессию по cookies, загруженным в меню бота (через curl_cffi).
-    """
-    night_mode = await models.get_setting("night_mode", "0") == "1"
-    if night_mode and _is_night_time():
-        return False, "Активен ночной режим (00:00–07:00)"
+class AvitoMessenger:
+    def __init__(self, proxy_url: str | None = None) -> None:
+        self.proxy_url = proxy_url or settings.PROXY_URL
 
-    hourly_limit = int(await models.get_setting("hourly_limit", "15"))
-    sent_last_hour = await models.get_sent_count_last_hour()
-    if sent_last_hour >= hourly_limit:
-        return False, f"Достигнут лимит сообщений в час ({sent_last_hour}/{hourly_limit})"
-
-    await asyncio.sleep(random.uniform(1.5, 4.0))
-    proxy = settings.PROXY_URL
-
-    # Вариант 1: Официальный Avito Messenger API
-    if settings.AVITO_ACCESS_TOKEN and settings.AVITO_USER_ID:
-        api_url = (
-            f"https://api.avito.ru/messenger/v1/accounts/"
-            f"{settings.AVITO_USER_ID}/chats/{item_id}/messages"
-        )
+    def _build_headers(self, item_url: str, access_token: str | None = None) -> dict[str, str]:
         headers = {
-            "Authorization": f"Bearer {settings.AVITO_ACCESS_TOKEN}",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             "Content-Type": "application/json",
+            "Origin": "https://www.avito.ru",
+            "Referer": item_url or "https://www.avito.ru/",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-Source": "web",
         }
-        payload = {"message": {"text": text}, "type": "text"}
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token}"
+        return headers
+
+    async def check_session(self, cookies_json: str | None, access_token: str | None = None) -> tuple[bool, str]:
+        """Проверяет валидность привязанных cookies или токена Авито."""
+        cookies = normalize_cookies(cookies_json or "")
+        if not cookies and not access_token:
+            return False, "Не найдены ключевые cookies Авито (u, v, sessid)."
+
+        proxies = {"http": self.proxy_url, "https": self.proxy_url} if self.proxy_url else None
+        headers = self._build_headers("https://www.avito.ru/profile", access_token)
+
         try:
-            async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as session:
-                async with session.post(api_url, json=payload, proxy=proxy) as resp:
-                    if resp.status in (200, 201):
-                        await models.log_sent_message(item_id, seller_id)
-                        return True, "Отправлено через Avito API"
-                    body = await resp.text()
-                    return False, f"Ошибка Avito API ({resp.status}): {body[:120]}"
-        except Exception as e:
-            return False, f"Сетевая ошибка API: {type(e).__name__}: {e}"
-
-    # Вариант 2: Привязанный аккаунт по Cookies из меню бота
-    account = await models.get_account()
-    if not account or not account.get("cookies_json"):
-        return False, "Аккаунт Avito не привязан (загрузите cookies или токен)"
-
-    if not account.get("is_valid"):
-        return False, "Сессия Avito устарела — обновите cookies"
-
-    try:
-        cookies_dict = json.loads(account["cookies_json"])
-    except Exception:
-        return False, "Поврежденный формат cookies в БД"
-
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Origin": "https://www.avito.ru",
-        "Referer": f"https://www.avito.ru/items/{item_id}",
-    }
-
-    session_check_url = "https://www.avito.ru/web/1/profile/short"
-    msg_url = f"https://www.avito.ru/web/1/messenger/items/{item_id}/chat"
-
-    try:
-        if HAS_CURL_CFFI:
-            async with CurlAsyncSession(impersonate="chrome", timeout=15) as session:
-                check_resp = await session.get(
-                    session_check_url, headers=headers, cookies=cookies_dict, proxy=proxy
+            async with AsyncSession(impersonate="chrome124", proxies=proxies, timeout=20) as session:
+                resp = await session.get(
+                    "https://www.avito.ru/web/1/profile/short",
+                    cookies=cookies,
+                    headers=headers,
                 )
-                if check_resp.status_code in (401, 403):
-                    await models.set_account_validity(0)
-                    return False, "Сессия cookies истекла (401/403). Загрузите новые cookies!"
-
-                resp = await session.post(
-                    msg_url, json={"text": text}, headers=headers, cookies=cookies_dict, proxy=proxy
-                )
-                if resp.status_code in (200, 201):
-                    await models.log_sent_message(item_id, seller_id)
-                    return True, "Сообщение отправлено первым"
+                if resp.status_code == 200:
+                    data = resp.json()
+                    name = data.get("name") or data.get("user", {}).get("name") or "Профиль Avito"
+                    return True, f"Аккаунт подключён: {name}"
                 if resp.status_code in (401, 403):
-                    await models.set_account_validity(0)
-                    return False, "Сессия cookies истекла (401/403). Обновите cookies!"
-                logger.warning("Avito messenger status %s: %s", resp.status_code, resp.text[:200])
-                return False, f"Продавец закрыл сообщения или изменился эндпоинт (HTTP {resp.status_code})"
+                    return False, "Сессия недействительна или устарела. Войдите в Avito заново и обновите данные."
+                # Если short-профиль временно недоступен, но куки u и sessid на месте
+                if "sessid" in cookies and "u" in cookies:
+                    return True, "Ключевые cookies (u, sessid) сохранены."
+                return False, f"Avito вернул статус {resp.status_code} при проверке профиля."
+        except Exception as e:
+            logger.warning("Ошибка проверки сессии Avito: %s", e)
+            if "sessid" in cookies and "u" in cookies:
+                return True, "Cookies сохранены (проверка отложена из-за таймаута прокси)."
+            return False, f"Ошибка соединения через прокси: {e}"
 
-        headers["User-Agent"] = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        )
-        async with aiohttp.ClientSession(
-            headers=headers, cookies=cookies_dict, timeout=aiohttp.ClientTimeout(total=15)
-        ) as session:
-            async with session.get(session_check_url, proxy=proxy) as check_resp:
-                if check_resp.status in (401, 403):
-                    await models.set_account_validity(0)
-                    return False, "Сессия cookies истекла (401/403). Загрузите новые cookies!"
+    async def send_message(
+        self,
+        item_id: int | str,
+        item_url: str,
+        text: str,
+        cookies_json: str | None = None,
+        access_token: str | None = None,
+    ) -> tuple[bool, str]:
+        """Создаёт чат по объявлению и отправляет первое сообщение продавцу."""
+        cookies = normalize_cookies(cookies_json or "")
+        token = access_token or settings.AVITO_ACCESS_TOKEN
 
-            async with session.post(msg_url, json={"text": text}, proxy=proxy) as resp:
-                if resp.status in (200, 201):
-                    await models.log_sent_message(item_id, seller_id)
-                    return True, "Сообщение отправлено первым"
-                if resp.status in (401, 403):
-                    await models.set_account_validity(0)
-                    return False, "Сессия cookies истекла (401/403). Обновите cookies!"
-                return False, f"Продавец закрыл сообщения или изменился эндпоинт (HTTP {resp.status})"
-    except Exception as e:
-        logger.error("Ошибка при отправке сообщения по объявлению %s: %s (%s)", item_id, type(e).__name__, e)
-        return False, f"Ошибка соединения: {type(e).__name__}"
+        if not cookies and not token:
+            return False, "NO_ACCOUNT"
+
+        try:
+            numeric_item_id = int(str(item_id).strip())
+        except ValueError:
+            return False, f"Некорректный ID объявления: {item_id}"
+
+        proxies = {"http": self.proxy_url, "https": self.proxy_url} if self.proxy_url else None
+        headers = self._build_headers(item_url, token)
+
+        async with AsyncSession(impersonate="chrome124", proxies=proxies, timeout=25) as session:
+            # Шаг 1: Прогрев страницы объявления для получения актуального X-Xsrf / контекста
+            try:
+                await session.get(item_url, cookies=cookies, headers={"Referer": "https://www.avito.ru/"})
+            except Exception:
+                pass
+
+            # Шаг 2: Пробуем актуальные эндпоинты создания канала и отправки сообщения
+            endpoints = [
+                # Актуальный Web Messenger API v1/v2
+                (
+                    "https://www.avito.ru/web/1/messenger/createChannelByItemId",
+                    {"itemId": numeric_item_id},
+                    "channel",
+                ),
+                (
+                    "https://www.avito.ru/web/2/messenger/createChannelByItemId",
+                    {"itemId": numeric_item_id},
+                    "channel",
+                ),
+                # Прямая отправка сообщения в одном запросе (новый формат)
+                (
+                    f"https://www.avito.ru/web/1/items/{numeric_item_id}/messenger/send",
+                    {"message": {"text": text}, "type": "text"},
+                    "direct",
+                ),
+            ]
+
+            channel_id: str | None = None
+            last_status: int | None = None
+
+            for url, payload, mode in endpoints:
+                try:
+                    resp = await session.post(url, json=payload, cookies=cookies, headers=headers)
+                    last_status = resp.status_code
+
+                    if resp.status_code in (401, 403):
+                        return False, "Сессия Avito истекла (401/403). Перепривяжите аккаунт."
+
+                    if resp.status_code == 400:
+                        body = resp.text.lower()
+                        if "closed" in body or "disabled" in body or "недоступ" in body:
+                            return False, "Продавец отключил сообщения в этом объявлении."
+
+                    if resp.status_code in (200, 201):
+                        data = resp.json()
+                        if mode == "direct":
+                            return True, "Сообщение отправлено"
+
+                        channel_id = (
+                            data.get("channel", {}).get("id")
+                            or data.get("result", {}).get("channel", {}).get("id")
+                            or data.get("id")
+                            or data.get("channelId")
+                        )
+                        if channel_id:
+                            break
+                except Exception as e:
+                    logger.debug("Ошибка запроса к %s: %s", url, e)
+
+            if not channel_id:
+                if last_status == 404:
+                    return False, "Продавец закрыл сообщения или объявление уже снято (404)."
+                if last_status == 439:
+                    return False, "Антибот-лимит Авито (439) при отправке. Попробуйте позже."
+                return False, f"Не удалось открыть диалог с продавцом (HTTP {last_status or 'ERR'})."
+
+            # Шаг 3: Отправляем текст в созданный канал
+            send_endpoints = [
+                (
+                    "https://www.avito.ru/web/1/messenger/sendTextMessage",
+                    {"channelId": channel_id, "text": text, "randomId": f"sniper_{numeric_item_id}"},
+                ),
+                (
+                    f"https://www.avito.ru/web/1/messenger/channels/{channel_id}/messages",
+                    {"type": "text", "message": {"text": text}},
+                ),
+            ]
+
+            for send_url, send_payload in send_endpoints:
+                try:
+                    s_resp = await session.post(send_url, json=send_payload, cookies=cookies, headers=headers)
+                    if s_resp.status_code in (200, 201):
+                        return True, "Сообщение отправлено"
+                    last_status = s_resp.status_code
+                except Exception as e:
+                    logger.debug("Ошибка отправки текста в %s: %s", send_url, e)
+
+            return False, f"Чат открыт, но текст не доставлен (HTTP {last_status or 'ERR'})."
