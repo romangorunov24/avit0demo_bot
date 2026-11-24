@@ -6,21 +6,16 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔍 Мои поиски"), KeyboardButton(text="➕ Добавить поиск")],
-            [KeyboardButton(text="👤 Мой Avito"), KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="⚙️ Настройки")],
         ],
         resize_keyboard=True,
     )
 
 
-def account_menu_kb(is_connected: bool) -> InlineKeyboardMarkup:
+def account_menu_kb(is_connected: bool = False) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text="💻 Подключить с ПК (файл / JSON)", callback_data="acc_connect_pc")],
-        [InlineKeyboardButton(text="📱 Подключить с телефона (без ПК)", callback_data="acc_connect_mobile")],
-        [InlineKeyboardButton(text="💬 Шаблон автоотклика", callback_data="acc_set_template")],
+        [InlineKeyboardButton(text="🗑 Очистить данные сессии", callback_data="acc_disconnect")],
     ]
-    if is_connected:
-        buttons.append([InlineKeyboardButton(text="🔄 Проверить сессию", callback_data="acc_check")])
-        buttons.append([InlineKeyboardButton(text="🗑 Отвязать аккаунт", callback_data="acc_disconnect")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -48,29 +43,19 @@ def searches_list_kb(searches: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def search_detail_kb(search_id: int, is_active: bool = True, auto_reply: bool = True) -> InlineKeyboardMarkup:
+def search_detail_kb(search_id: int, is_active: bool = True, auto_reply: bool = False) -> InlineKeyboardMarkup:
     toggle_text = "⏸ Приостановить" if is_active else "▶️ Включить"
-    reply_text = "💬 Автоотклик: ВКЛ" if auto_reply else "🔕 Автоотклик: ВЫКЛ"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text=toggle_text, callback_data=f"toggle_search_{search_id}"),
-                InlineKeyboardButton(text=reply_text, callback_data=f"toggle_reply_{search_id}"),
-            ],
-            [InlineKeyboardButton(text="✏️ Изменить шаблон", callback_data=f"edit_tpl_{search_id}")],
+            [InlineKeyboardButton(text=toggle_text, callback_data=f"toggle_search_{search_id}")],
             [InlineKeyboardButton(text="🗑 Удалить поиск", callback_data=f"del_search_{search_id}")],
             [InlineKeyboardButton(text="⬅️ Назад к спискам", callback_data="back_searches")],
         ]
     )
 
 
-def item_card_kb(item_url: str, item_id: int | str, seller_id: str | None, has_account: bool) -> InlineKeyboardMarkup:
+def item_card_kb(item_url: str, item_id: int | str, seller_id: str | None = None, has_account: bool = False) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text="🔗 Открыть на Авито", url=item_url)]]
-    if has_account:
-        action_row = [InlineKeyboardButton(text="💬 Написать ещё", callback_data=f"reply_{item_id}")]
-        if seller_id:
-            action_row.append(InlineKeyboardButton(text="🚫 Продавца в ЧС", callback_data=f"ban_{seller_id}"))
-        rows.append(action_row)
-    else:
-        rows.append([InlineKeyboardButton(text="⚡ Подключить Avito для автоотклика", callback_data="acc_menu_open")])
+    if seller_id:
+        rows.append([InlineKeyboardButton(text="🚫 Продавца в ЧС", callback_data=f"ban_{seller_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
