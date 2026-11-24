@@ -4,9 +4,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     BOT_TOKEN: str
-    ADMIN_IDS: str
+    ADMIN_IDS: str = ""
     PROXY_URL: str | None = None
-    CHECK_INTERVAL_SEC: int = 60
+    CHECK_INTERVAL_SEC: int = 90
     DB_PATH: str = "avito_bot.db"
     AVITO_USER_ID: str | None = None
     AVITO_ACCESS_TOKEN: str | None = None
@@ -17,9 +17,16 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    @field_validator("BOT_TOKEN", "ADMIN_IDS", "DB_PATH", mode="before")
+    @field_validator("BOT_TOKEN", "DB_PATH", mode="before")
     @classmethod
     def _strip_required(cls, v: object) -> str:
+        return str(v).strip()
+
+    @field_validator("ADMIN_IDS", mode="before")
+    @classmethod
+    def _strip_admins(cls, v: object) -> str:
+        if v is None:
+            return ""
         return str(v).strip()
 
     @field_validator("PROXY_URL", "AVITO_USER_ID", "AVITO_ACCESS_TOKEN", mode="before")
@@ -32,7 +39,9 @@ class Settings(BaseSettings):
 
     @property
     def admin_ids_list(self) -> list[int]:
-        return [int(x.strip()) for x in str(self.ADMIN_IDS).split(",") if x.strip().isdigit()]
+        if self.ADMIN_IDS in ("", "0", "*", "all"):
+            return []
+        return [int(x.strip()) for x in self.ADMIN_IDS.split(",") if x.strip().isdigit() and int(x.strip()) > 0]
 
 
 settings = Settings()

@@ -94,16 +94,12 @@ class AvitoMessenger:
                     name = data.get("name") or data.get("user", {}).get("name") or "Профиль Avito"
                     return True, f"Аккаунт подключён: {name}"
                 if resp.status_code == 429:
-                    return False, "IP прокси упёрся в лимит Авито (HTTP 429). Смените IP прокси."
+                    return False, "IP прокси упёрся в лимит (HTTP 429). Смените IP."
                 if resp.status_code == 403:
-                    ctype = resp.headers.get("content-type", "").lower()
-                    body = resp.text.lower()
-                    if "text/html" in ctype or "доступ ограничен" in body or "проблема с ip" in body:
-                        return False, "Прокси-IP заблокирован фаерволом Авито (HTTP 403 WAF). Смените прокси в PROXY_URL."
-                    return False, "Сессия отклонена Авито (HTTP 403). Перепривяжите аккаунт."
+                    return False, "Блок WAF или смены IP (HTTP 403). Используйте единый прокси при входе."
                 if resp.status_code == 401:
-                    return False, "Сессия устарела (HTTP 401). Войдите в Avito заново и обновите cookies."
-                return False, f"Avito вернул статус {resp.status_code} при проверке профиля."
+                    return False, "Сессия устарела (HTTP 401). Обновите cookies."
+                return False, f"Avito вернул статус {resp.status_code}."
         except Exception as e:
             logger.warning("Ошибка проверки сессии Avito: %s", e)
             return False, f"Ошибка соединения через прокси: {e}"
@@ -162,25 +158,14 @@ class AvitoMessenger:
                     resp = await session.post(url, json=payload, cookies=cookies, headers=headers)
                     last_status = resp.status_code
 
-                    if resp.status_code == 401:
-                        return False, "Сессия Avito истекла (401). Перепривяжите аккаунт."
-
-                    if resp.status_code == 403:
-                        return False, "Доступ запрещён (403 WAF по IP прокси или устаревшая сессия)."
-
+                    if resp.status_code in (401, 403):
+                        return False, "Сессия отклонена (401/403). Перепривяжите через единый прокси."
                     if resp.status_code == 429:
-                        return False, "Лимит запросов Авито (HTTP 429) на IP прокси."
-
-                    if resp.status_code == 400:
-                        body = resp.text.lower()
-                        if "closed" in body or "disabled" in body or "недоступ" in body:
-                            return False, "Продавец отключил сообщения в этом объявлении."
-
+                        return False, "Лимит запросов (429) на IP прокси."
                     if resp.status_code in (200, 201):
                         data = resp.json()
                         if mode == "direct":
                             return True, "Сообщение отправлено"
-
                         channel_id = (
                             data.get("channel", {}).get("id")
                             or data.get("result", {}).get("channel", {}).get("id")
@@ -193,13 +178,9 @@ class AvitoMessenger:
                     logger.debug("Ошибка запроса к %s: %s", url, e)
 
             if not channel_id:
-                if last_status == 404:
-                    return False, "Продавец закрыл сообщения или объявление уже снято (404)."
-                if last_status == 439:
-                    return False, "Антибот-лимит Авито (439) при отправке."
-                return False, f"Не удалось открыть диалог (HTTP {last_status or 'ERR'})."
+                return False, f"Диалог недоступен (HTTP {last_status or 'ERR'})."
 
-            send_endpoints = [
+            for send_url, send_payload in (
                 (
                     "https://www.avito.ru/web/1/messenger/sendTextMessage",
                     {"channelId": channel_id, "text": text, "randomId": f"sniper_{numeric_item_id}"},
@@ -208,9 +189,7 @@ class AvitoMessenger:
                     f"https://www.avito.ru/web/1/messenger/channels/{channel_id}/messages",
                     {"type": "text", "message": {"text": text}},
                 ),
-            ]
-
-            for send_url, send_payload in send_endpoints:
+            ):
                 try:
                     s_resp = await session.post(send_url, json=send_payload, cookies=cookies, headers=headers)
                     if s_resp.status_code in (200, 201):
@@ -219,25 +198,4 @@ class AvitoMessenger:
                 except Exception as e:
                     logger.debug("Ошибка отправки текста в %s: %s", send_url, e)
 
-            return False, f"Чат открыт, но текст не доставлен (HTTP {last_status or 'ERR'})."
-
-
-async def send_first_message(
-    item_id: int | str,
-    text: str,
-    item_url: str | None = None,
-    cookies_json: str | None = None,
-    cookies: str | None = None,
-    access_token: str | None = None,
-    **kwargs: Any,
-) -> tuple[bool, str]:
-    messenger = AvitoMessenger()
-    target_url = item_url or f"https://www.avito.ru/items/{item_id}"
-    raw_cookies = cookies_json or cookies
-    return await messenger.send_message(
-        item_id=item_id,
-        item_url=target_url,
-        text=text,
-        cookies_json=raw_cookies,
-        access_token=access_token,
-    )
+            return False, f"Текст не доставлен (HTTP {last_status or 'ERR'})."

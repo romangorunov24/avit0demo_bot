@@ -65,8 +65,8 @@ def _extract_location(card) -> str:
     return "Не указано"
 
 
-async def parse_avito_search(search_url: str, search_name: str = "", cookies_json: str | None = None) -> list[dict]:
-    """Парсит свежие объявления с прогревом анонимной гостевой сессии (без личного аккаунта)."""
+async def parse_avito_search(search_url: str, search_name: str = "") -> list[dict]:
+    """Парсит выдачу с прогревом анонимной гостевой сессии (без личных аккаунтов)."""
     url = _ensure_sorted_by_date(search_url.strip())
     proxies = {"http": settings.PROXY_URL, "https": settings.PROXY_URL} if settings.PROXY_URL else None
 
@@ -83,17 +83,16 @@ async def parse_avito_search(search_url: str, search_name: str = "", cookies_jso
 
     try:
         async with AsyncSession(impersonate="chrome124", proxies=proxies, timeout=25) as session:
-            # Если гостевых кук ещё нет — прогреваем главную страницу Авито
             if not _GUEST_COOKIES:
                 warm_headers = {**base_headers, "Sec-Fetch-Site": "none"}
                 warm_resp = await session.get("https://www.avito.ru/", headers=warm_headers)
                 if warm_resp.status_code in (403, 429):
                     logger.warning(
-                        "Avito вернул статус %s при прогреве главной страницы (проблема с IP прокси)",
+                        "Avito вернул статус %s при прогреве главной страницы (проверьте IP прокси)",
                         warm_resp.status_code,
                     )
                     return []
-                await asyncio.sleep(random.uniform(1.5, 3.0))
+                await asyncio.sleep(random.uniform(1.2, 2.5))
 
             search_headers = {
                 **base_headers,
@@ -104,7 +103,7 @@ async def parse_avito_search(search_url: str, search_name: str = "", cookies_jso
 
             if resp.status_code in (403, 429):
                 _GUEST_COOKIES.clear()
-                logger.warning("Avito вернул статус %s (лимит/блок IP прокси) для поиска '%s'", resp.status_code, search_name or url)
+                logger.warning("Avito вернул статус %s для поиска '%s'", resp.status_code, search_name or url)
                 return []
 
             if resp.status_code != 200:
@@ -172,7 +171,9 @@ async def parse_avito_search(search_url: str, search_name: str = "", cookies_jso
             if m:
                 seller_id = m.group(1)
 
-        seller_type = "Магазин / Компания" if card.select_one('[data-marker="item-badge-company"]') else "Частное лицо"
+        is_company = bool(card.select_one('[data-marker="item-badge-company"]'))
+        seller_code = "company" if is_company else "private"
+        seller_type = "Магазин / Компания" if is_company else "Частное лицо"
 
         items.append(
             {
@@ -184,6 +185,7 @@ async def parse_avito_search(search_url: str, search_name: str = "", cookies_jso
                 "location": location,
                 "image_url": image_url,
                 "seller_id": seller_id,
+                "seller_code": seller_code,
                 "seller_type": seller_type,
                 "discount_pct": 0,
             }

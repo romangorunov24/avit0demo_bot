@@ -7,16 +7,16 @@ class SearchStates(StatesGroup):
     waiting_min_price = State()
     waiting_max_price = State()
     waiting_sniper_price = State()
+    waiting_plus_words = State()
     waiting_stop_words = State()
     waiting_template = State()
-    waiting_edit_template = State()
+    waiting_edit_field = State()
 
 
-class AccountStates(StatesGroup):
-    waiting_cookies_pc = State()
-    waiting_mobile_session = State()
-    waiting_default_template = State()
-
-
-class ActionStates(StatesGroup):
-    waiting_custom_message = State()
+class SettingsStates(StatesGroup):
+    waiting_tpl_main = State()
+    waiting_tpl_bargain = State()
+    waiting_tpl_delivery = State()
+    waiting_quiet_hours = State()
+    waiting_discount_pct = State()
+    waiting_cookies = State()
