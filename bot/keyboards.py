@@ -1,3 +1,4 @@
+from typing import Any
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 
@@ -26,6 +27,34 @@ def account_menu_kb(is_connected: bool) -> InlineKeyboardMarkup:
 def cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_fsm")]]
+    )
+
+
+def searches_list_kb(searches: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for s in searches:
+        status_icon = "🟢" if s.get("is_active", True) else "⏸"
+        name = s.get("name") or f"Поиск #{s.get('id')}"
+        rows.append(
+            [InlineKeyboardButton(text=f"{status_icon} {name}", callback_data=f"search_{s['id']}")]
+        )
+    rows.append([InlineKeyboardButton(text="➕ Добавить поиск", callback_data="add_search")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def search_detail_kb(search_id: int, is_active: bool = True, auto_reply: bool = True) -> InlineKeyboardMarkup:
+    toggle_text = "⏸ Приостановить" if is_active else "▶️ Включить"
+    reply_text = "💬 Автоотклик: ВКЛ" if auto_reply else "🔕 Автоотклик: ВЫКЛ"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=toggle_text, callback_data=f"toggle_search_{search_id}"),
+                InlineKeyboardButton(text=reply_text, callback_data=f"toggle_reply_{search_id}"),
+            ],
+            [InlineKeyboardButton(text="✏️ Изменить шаблон", callback_data=f"edit_tpl_{search_id}")],
+            [InlineKeyboardButton(text="🗑 Удалить поиск", callback_data=f"del_search_{search_id}")],
+            [InlineKeyboardButton(text="⬅️ Назад к спискам", callback_data="back_searches")],
+        ]
     )
 
 
