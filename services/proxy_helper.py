@@ -1,3 +1,4 @@
+import html
 from curl_cffi.requests import AsyncSession
 from config import settings
 
@@ -42,7 +43,6 @@ def get_proxy_candidates(raw_proxy: str | None = None) -> list[dict[str, str] | 
             {"http": f"socks5h://{normalized}", "https": f"socks5h://{normalized}"},
         ]
 
-    # Если схема не указана явно — пробуем сначала HTTP, затем SOCKS5H
     return [
         {"http": f"http://{normalized}", "https": f"http://{normalized}"},
         {"http": f"socks5h://{normalized}", "https": f"socks5h://{normalized}"},
@@ -54,10 +54,21 @@ async def diagnose_connection() -> str:
     using_proxy = candidates[0] is not None
     last_err = ""
 
+    browser_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    }
+
     for proxies in candidates:
         proto = "Прямое подключение (без прокси)" if not proxies else proxies["http"].split("://")[0].upper()
         try:
-            async with AsyncSession(impersonate="chrome124", proxies=proxies, timeout=15) as session:
+            async with AsyncSession(impersonate="chrome124", proxies=proxies, timeout=30) as session:
                 ip_resp = await session.get("https://ipwho.is/")
                 ip_info = "неизвестен"
                 country = "?"
@@ -68,17 +79,22 @@ async def diagnose_connection() -> str:
                     country = j.get("country_code") or "?"
                     isp = j.get("connection", {}).get("isp") or ""
 
-                avito_resp = await session.get("https://www.avito.ru/")
+                avito_resp = await session.get("https://www.avito.ru/", headers=browser_headers)
                 st = avito_resp.status_code
 
                 geo_note = "✅ Отлично (IP из России)" if country == "RU" else "⚠️ Внимание: IP не из России (возможен блок Авито)"
-                avito_note = "✅ Avito доступен (HTTP 200)" if st == 200 else f"❌ Avito вернул HTTP {st}"
+                if st == 200:
+                    avito_note = "✅ Avito доступен (HTTP 200)"
+                elif st == 429:
+                    avito_note = "⚠️ Avito вернул HTTP 429 (текущий узел пула занят — при следующем запросе IP сменится)"
+                else:
+                    avito_note = f"❌ Avito вернул HTTP {st}"
 
                 return (
                     f"🌐 <b>Диагностика сети</b>\n\n"
                     f"• Режим: <b>{proto}</b>\n"
-                    f"• Текущий IP: <code>{ip_info}</code> ({country})\n"
-                    f"• Провайдер: {isp or 'не определён'}\n"
+                    f"• Текущий IP: <code>{html.escape(str(ip_info))}</code> ({html.escape(str(country))})\n"
+                    f"• Провайдер: {html.escape(str(isp)) or 'не определён'}\n"
                     f"• Гео-статус: {geo_note}\n"
                     f"• Доступ к Avito: {avito_note}"
                 )
@@ -86,12 +102,12 @@ async def diagnose_connection() -> str:
             last_err = f"{proto}: {e}"
 
     hint = (
-        "Проверьте баланс трафика и порт в личном кабинете прокси, либо запустите бота локально на ПК в РФ с пустым PROXY_URL."
+        "Проверьте баланс трафика в кабинете прокси или запустите бота локально на ПК в РФ с пустым PROXY_URL."
         if using_proxy
         else "Проверьте интернет-соединение на устройстве."
     )
     return (
         f"❌ <b>Ошибка сетевого соединения</b>\n\n"
-        f"Детали: <code>{last_err[:220]}</code>\n\n"
+        f"Детали: <code>{html.escape(last_err[:220])}</code>\n\n"
         f"💡 {hint}"
     )
