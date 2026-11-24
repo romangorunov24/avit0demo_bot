@@ -1,143 +1,133 @@
 import asyncio
-import html
 import logging
 from aiogram import Bot
-from bot.keyboards import item_notification_kb
+from bot.keyboards import item_card_kb
 from config import settings
-from database import models
-from services.avito_messenger import send_first_message
-from services.avito_parser import AvitoItem, fetch_search_items, passes_filters
+from database import db
+from services.avito_messenger import AvitoMessenger, normalize_cookies
+from services.avito_parser import parse_avito_search
 from services.spintax import render_spintax
-from utils.helpers import calc_discount_percent
 
 logger = logging.getLogger(__name__)
 
 
-async def _notify_admins(
-    bot: Bot,
-    item: AvitoItem,
-    search: dict,
-    discount_pct: int | None,
-    reply_status_line: str,
-) -> None:
-    safe_title = html.escape(item.title)
-    safe_search = html.escape(search["name"])
-    safe_desc = html.escape(item.description) if item.description else "Описание отсутствует"
-    safe_loc = html.escape(item.location) if item.location else "Не указано"
-
-    price_str = f"{item.price:,}".replace(",", " ") + " ₽" if item.price > 0 else "Цена не указана"
-    discount_badge = (
-        f"\n🔥 <b>Выгодно: на {discount_pct}% ниже средней цены!</b>"
-        if discount_pct
-        else ""
-    )
-    seller_type = "🏢 Магазин / Компания" if item.is_company else "👤 Частное лицо"
-
-    caption = (
-        f"🆕 <b>Новое объявление</b> [{safe_search}]\n\n"
-        f"📌 <a href=\"{item.url}\"><b>{safe_title}</b></a>\n"
-        f"💰 <b>Цена:</b> {price_str}{discount_badge}\n"
-        f"📍 <b>Район:</b> {safe_loc}\n"
-        f"🧾 <b>Продавец:</b> {seller_type}\n\n"
-        f"📝 <i>{safe_desc[:250]}</i>\n\n"
-        f"{reply_status_line}"
-    )
-
-    kb = item_notification_kb(item.url, item.item_id, item.seller_id)
-
-    for admin_id in settings.admin_ids_list:
-        sent_with_photo = False
-        if item.image_url:
-            try:
-                await bot.send_photo(
-                    chat_id=admin_id,
-                    photo=item.image_url,
-                    caption=caption,
-                    reply_markup=kb,
-                    parse_mode="HTML",
-                )
-                sent_with_photo = True
-            except Exception as e:
-                logger.warning("Не удалось отправить фото админу %s (%s), отправляю текстом.", admin_id, e)
-
-        if not sent_with_photo:
-            try:
-                await bot.send_message(
-                    chat_id=admin_id,
-                    text=caption,
-                    reply_markup=kb,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-            except Exception as e:
-                logger.error("Не удалось отправить уведомление админу %s: %s", admin_id, e)
-
-
-async def _process_search(bot: Bot, search: dict) -> None:
-    sid = search["id"]
-    items = await fetch_search_items(search)
-    if not items:
-        return
-
-    already_seeded = await models.has_seen_items_for_search(sid)
-    if not already_seeded:
-        for it in items:
-            await models.add_seen_item(it.item_id, sid, it.price)
-        logger.info("Поиск '%s' инициализирован: сохранено %s стартовых объявлений.", search["name"], len(items))
-        return
-
-    avg_price = await models.get_average_price(sid, limit=50)
-    auto_reply_global = await models.get_setting("auto_reply_enabled", "1") == "1"
-    spintax_tpl = await models.get_setting("spintax_template")
-
-    for it in reversed(items):
-        if await models.is_item_seen(it.item_id):
-            continue
-
-        await models.add_seen_item(it.item_id, sid, it.price)
-
-        if not await passes_filters(it, search):
-            continue
-
-        discount_pct = calc_discount_percent(it.price, avg_price)
-        sniper_limit = search["sniper_price"] or 0
-
-        should_reply = auto_reply_global and (
-            sniper_limit == 0 or (it.price > 0 and it.price <= sniper_limit)
-        )
-
-        if should_reply:
-            msg_text = render_spintax(spintax_tpl, title=it.title, price=it.price)
-            ok, info = await send_first_message(
-                item_id=it.item_id,
-                text=msg_text,
-                seller_id=it.seller_id,
-            )
-            if ok:
-                reply_line = f"✅ <b>Написали первым:</b> <i>«{html.escape(msg_text)}»</i>"
-            else:
-                reply_line = f"⚠️ <b>Автоотклик не сработал:</b> {html.escape(info)}"
-        else:
-            if not auto_reply_global:
-                reply_line = "⏸ <b>Автоотклик отключен</b> (можно написать вручную)"
-            else:
-                reply_line = f"🎯 <b>Цена выше порога «Снайпер» ({sniper_limit} ₽)</b> — уведомление без автоответа"
-
-        await _notify_admins(bot, it, search, discount_pct, reply_line)
-
-
 async def worker_loop(bot: Bot) -> None:
     logger.info("Фоновый мониторинг Авито запущен (интервал: %s сек.)", settings.CHECK_INTERVAL_SEC)
+    messenger = AvitoMessenger()
+
     while True:
         try:
-            active_searches = await models.get_searches(only_active=True)
-            for search in active_searches:
-                await _process_search(bot, search)
-                await asyncio.sleep(1.0)
-        except asyncio.CancelledError:
-            logger.info("Фоновый воркер остановлен.")
-            break
-        except Exception as e:
-            logger.exception("Непредвиденная ошибка в цикле воркера: %s", e)
+            searches = await db.get_active_searches()
+            for search in searches:
+                search_id = search["id"]
+                user_id = search["user_id"]
+                title = search["name"]
+                url = search["url"]
 
-        await asyncio.sleep(max(3, settings.CHECK_INTERVAL_SEC))
+                user_settings = await db.get_user_settings(user_id)
+                cookies_raw = (user_settings or {}).get("avito_cookies")
+                has_account = bool(normalize_cookies(cookies_raw or ""))
+
+                items = await parse_avito_search(url, cookies_json=cookies_raw)
+                if not items:
+                    await asyncio.sleep(2)
+                    continue
+
+                is_initialized = await db.is_search_initialized(search_id)
+                if not is_initialized:
+                    for item in items:
+                        await db.mark_item_seen(search_id, str(item["id"]))
+                    logger.info("Поиск '%s' инициализирован: сохранено %d стартовых объявлений.", title, len(items))
+                    await asyncio.sleep(2)
+                    continue
+
+                for item in items:
+                    item_id = str(item["id"])
+                    if await db.is_item_seen(search_id, item_id):
+                        continue
+
+                    await db.mark_item_seen(search_id, item_id)
+
+                    seller_id = item.get("seller_id")
+                    if seller_id and await db.is_seller_blacklisted(user_id, str(seller_id)):
+                        continue
+
+                    price = item.get("price")
+                    min_price = search.get("min_price")
+                    max_price = search.get("max_price")
+                    if min_price and price and price < min_price:
+                        continue
+                    if max_price and price and price > max_price:
+                        continue
+
+                    # Автоотклик запускается ТОЛЬКО если у пользователя привязан аккаунт и включён автоотклик
+                    auto_reply_status = ""
+                    auto_reply_enabled = bool(search.get("auto_reply", True))
+
+                    if has_account and auto_reply_enabled:
+                        raw_tpl = (
+                            search.get("message_template")
+                            or (user_settings or {}).get("default_template")
+                            or "Здравствуйте! Объявление ещё актуально?"
+                        )
+                        msg_text = render_spintax(raw_tpl)
+                        sent_ok, sent_info = await messenger.send_message(
+                            item_id=item_id,
+                            item_url=item["url"],
+                            text=msg_text,
+                            cookies_json=cookies_raw,
+                        )
+                        if sent_ok:
+                            auto_reply_status = f"\n✅ <b>Автоотклик отправлен:</b> <i>«{msg_text}»</i>"
+                        else:
+                            auto_reply_status = f"\nℹ️ <b>Автоотклик:</b> {sent_info}"
+
+                    price_str = f"{price:,} ₽".replace(",", " ") if price else "Не указана"
+                    discount_line = ""
+                    if item.get("discount_pct") and item["discount_pct"] >= 10:
+                        discount_line = f"\n🔥 <b>Выгодно:</b> на {item['discount_pct']}% ниже средней цены!"
+
+                    caption = (
+                        f"🆕 <b>Новое объявление</b> [{title}]\n\n"
+                        f"📌 <b>{item['title']}</b>\n"
+                        f"💰 Цена: <b>{price_str}</b>{discount_line}\n"
+                        f"📍 Район: {item.get('location') or 'Не указано'}\n"
+                        f"👤 Продавец: {item.get('seller_type') or 'Частное лицо'}\n\n"
+                        f"📝 <i>{(item.get('description') or 'Описание отсутствует')[:300]}</i>"
+                        f"{auto_reply_status}"
+                    )
+
+                    kb = item_card_kb(item["url"], item_id, seller_id, has_account)
+
+                    try:
+                        if item.get("image_url"):
+                            await bot.send_photo(
+                                chat_id=user_id,
+                                photo=item["image_url"],
+                                caption=caption,
+                                parse_mode="HTML",
+                                reply_markup=kb,
+                            )
+                        else:
+                            await bot.send_message(
+                                chat_id=user_id,
+                                text=caption,
+                                parse_mode="HTML",
+                                reply_markup=kb,
+                                disable_web_page_preview=True,
+                            )
+                    except Exception as send_err:
+                        logger.warning("Ошибка отправки фото, шлю текстом: %s", send_err)
+                        await bot.send_message(
+                            chat_id=user_id,
+                            text=caption,
+                            parse_mode="HTML",
+                            reply_markup=kb,
+                            disable_web_page_preview=True,
+                        )
+
+                await asyncio.sleep(2)
+        except Exception as e:
+            logger.error("Ошибка в цикле worker_loop: %s", e)
+
+        await asyncio.sleep(settings.CHECK_INTERVAL_SEC)
