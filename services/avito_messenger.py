@@ -21,7 +21,6 @@ def normalize_cookies(raw_cookies: str | list[dict[str, Any]] | dict[str, Any]) 
             except json.JSONDecodeError:
                 pass
 
-        # Извлекаем куки даже из обрезанных кусков JSON, разбитых лимитом Telegram (4096 символов)
         for block in re.findall(r"\{[^{}]+\}", text):
             name_m = re.search(r'"name"\s*:\s*"([^"]+)"', block)
             val_m = re.search(r'"value"\s*:\s*"([^"]*)"', block)
@@ -30,7 +29,6 @@ def normalize_cookies(raw_cookies: str | list[dict[str, Any]] | dict[str, Any]) 
                 if k in important_keys and v:
                     result[k] = v
 
-        # Извлекаем куки из строки формата "u=...; v=...; sessid=..."
         for part in text.split(";"):
             if "=" in part:
                 k, v = part.strip().split("=", 1)
@@ -95,15 +93,15 @@ class AvitoMessenger:
                     data = resp.json()
                     name = data.get("name") or data.get("user", {}).get("name") or "Профиль Avito"
                     return True, f"Аккаунт подключён: {name}"
+                if resp.status_code == 429:
+                    return False, "IP прокси упёрся в лимит Авито (HTTP 429). Смените IP на прокси и проверьте снова."
                 if resp.status_code in (401, 403):
-                    return False, "Сессия недействительна или устарела. Войдите в Avito заново."
+                    return False, "Сессия недействительна или устарела (401/403). Войдите в Avito заново."
                 if "sessid" in cookies and "u" in cookies:
-                    return True, "Ключевые cookies (u, sessid) сохранены."
+                    return True, f"Ключевые cookies сохранены (ответ Avito: HTTP {resp.status_code})."
                 return False, f"Avito вернул статус {resp.status_code} при проверке профиля."
         except Exception as e:
             logger.warning("Ошибка проверки сессии Avito: %s", e)
-            if "sessid" in cookies and "u" in cookies:
-                return True, "Cookies сохранены (проверка отложена из-за таймаута прокси)."
             return False, f"Ошибка соединения через прокси: {e}"
 
     async def send_message(
@@ -162,6 +160,9 @@ class AvitoMessenger:
 
                     if resp.status_code in (401, 403):
                         return False, "Сессия Avito истекла (401/403). Перепривяжите аккаунт."
+
+                    if resp.status_code == 429:
+                        return False, "Лимит запросов Авито (HTTP 429) на IP прокси."
 
                     if resp.status_code == 400:
                         body = resp.text.lower()
