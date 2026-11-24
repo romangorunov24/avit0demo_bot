@@ -1,12 +1,14 @@
 import logging
+import random
 import re
 import statistics
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 from config import settings
-from services.avito_messenger import normalize_cookies
 
 logger = logging.getLogger(__name__)
+
+IMPERSONATE_PROFILES = ["chrome124", "chrome120", "chrome116", "edge101"]
 
 
 def _ensure_sorted_by_date(url: str) -> str:
@@ -17,20 +19,25 @@ def _ensure_sorted_by_date(url: str) -> str:
 
 
 async def parse_avito_search(search_url: str, search_name: str = "", cookies_json: str | None = None) -> list[dict]:
+    """Парсит свежие объявления без использования личных cookies аккаунта."""
     url = _ensure_sorted_by_date(search_url.strip())
     proxies = {"http": settings.PROXY_URL, "https": settings.PROXY_URL} if settings.PROXY_URL else None
-    cookies = normalize_cookies(cookies_json or "")
+    profile = random.choice(IMPERSONATE_PROFILES)
 
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
         "Upgrade-Insecure-Requests": "1",
     }
 
     try:
-        async with AsyncSession(impersonate="chrome124", proxies=proxies, timeout=25) as session:
-            resp = await session.get(url, headers=headers, cookies=cookies)
+        async with AsyncSession(impersonate=profile, proxies=proxies, timeout=25) as session:
+            resp = await session.get(url, headers=headers)
+            if resp.status_code == 429:
+                logger.warning("Avito вернул статус 429 (лимит IP прокси) для поиска '%s'", search_name or url)
+                return []
             if resp.status_code != 200:
                 logger.warning("Avito вернул статус %s для поиска '%s'", resp.status_code, search_name or url)
                 return []
