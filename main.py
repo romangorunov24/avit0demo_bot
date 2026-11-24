@@ -22,17 +22,14 @@ async def main() -> None:
     bot = Bot(token=settings.BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
 
-    # Ограничение доступа только для администраторов из ADMIN_IDS
     dp.message.middleware(AdminMiddleware())
     dp.callback_query.middleware(AdminMiddleware())
 
-    # Регистрация роутеров
     dp.include_router(start.router)
     dp.include_router(searches.router)
     dp.include_router(account.router)
     dp.include_router(actions.router)
 
-    # Запуск фонового парсера и автоотправщика
     bg_task = asyncio.create_task(worker_loop(bot))
 
     try:
