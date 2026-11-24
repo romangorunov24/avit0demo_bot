@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Any
 from curl_cffi.requests import AsyncSession
 from config import settings
@@ -7,7 +8,7 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 
-def normalize_cookies(raw_cookies: str | list[dict[str, Any]]) -> dict[str, str]:
+def normalize_cookies(raw_cookies: str | list[dict[str, Any]] | dict[str, Any]) -> dict[str, str]:
     important_keys = {"u", "v", "sessid", "srv_id", "ft", "auth", "f"}
     result: dict[str, str] = {}
 
@@ -19,6 +20,17 @@ def normalize_cookies(raw_cookies: str | list[dict[str, Any]]) -> dict[str, str]
                 return normalize_cookies(parsed)
             except json.JSONDecodeError:
                 pass
+
+        # Извлекаем куки даже из обрезанных кусков JSON, разбитых лимитом Telegram (4096 символов)
+        for block in re.findall(r"\{[^{}]+\}", text):
+            name_m = re.search(r'"name"\s*:\s*"([^"]+)"', block)
+            val_m = re.search(r'"value"\s*:\s*"([^"]*)"', block)
+            if name_m and val_m:
+                k, v = name_m.group(1).strip(), val_m.group(1).strip()
+                if k in important_keys and v:
+                    result[k] = v
+
+        # Извлекаем куки из строки формата "u=...; v=...; sessid=..."
         for part in text.split(";"):
             if "=" in part:
                 k, v = part.strip().split("=", 1)
