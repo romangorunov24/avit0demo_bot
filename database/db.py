@@ -5,10 +5,19 @@ from config import settings
 DB_FILE = settings.DB_PATH
 
 
+async def _ensure_column(db: aiosqlite.Connection, table: str, column: str, definition: str) -> None:
+    cur = await db.execute(f"PRAGMA table_info({table})")
+    cols = [row[1] for row in await cur.fetchall()]
+    if column not in cols:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 async def init_db() -> None:
     db_dir = os.path.dirname(DB_FILE)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
+
+    default_admin = settings.admin_ids_list[0] if settings.admin_ids_list else 0
 
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
@@ -22,7 +31,7 @@ async def init_db() -> None:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS searches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL DEFAULT 0,
                 name TEXT NOT NULL,
                 url TEXT NOT NULL,
                 min_price INTEGER,
@@ -44,11 +53,26 @@ async def init_db() -> None:
         """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS blacklist (
-                user_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL DEFAULT 0,
                 seller_id TEXT NOT NULL,
                 PRIMARY KEY (user_id, seller_id)
             )
         """)
+
+        # Автоматическое добавление недостающих колонок в существующую БД Railway
+        await _ensure_column(db, "searches", "user_id", f"INTEGER NOT NULL DEFAULT {default_admin}")
+        await _ensure_column(db, "searches", "min_price", "INTEGER")
+        await _ensure_column(db, "searches", "max_price", "INTEGER")
+        await _ensure_column(db, "searches", "stop_words", "TEXT")
+        await _ensure_column(db, "searches", "message_template", "TEXT")
+        await _ensure_column(db, "searches", "auto_reply", "INTEGER DEFAULT 1")
+        await _ensure_column(db, "searches", "is_active", "INTEGER DEFAULT 1")
+        await _ensure_column(db, "searches", "is_initialized", "INTEGER DEFAULT 0")
+        await _ensure_column(db, "blacklist", "user_id", f"INTEGER NOT NULL DEFAULT {default_admin}")
+
+        if default_admin:
+            await db.execute("UPDATE searches SET user_id = ? WHERE user_id = 0 OR user_id IS NULL", (default_admin,))
+
         await db.commit()
 
 
