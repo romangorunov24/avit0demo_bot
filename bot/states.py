@@ -3,10 +3,16 @@ from aiogram.fsm.state import State, StatesGroup
 
 class SearchStates(StatesGroup):
     waiting_name = State()
+    waiting_title = State()
     waiting_url = State()
     waiting_min_price = State()
     waiting_max_price = State()
+    waiting_sniper_price = State()
+    waiting_target_price = State()
+    waiting_price = State()
     waiting_template = State()
+    waiting_message = State()
+    waiting_edit_template = State()
 
 
 class AccountStates(StatesGroup):
