@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 import re
@@ -8,7 +9,7 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
-IMPERSONATE_PROFILES = ["chrome124", "chrome120", "chrome116", "edge101"]
+_GUEST_COOKIES: dict[str, str] = {}
 
 
 def _ensure_sorted_by_date(url: str) -> str:
@@ -19,7 +20,6 @@ def _ensure_sorted_by_date(url: str) -> str:
 
 
 def _extract_description(card) -> str:
-    # 1. Прямые маркеры и актуальные классы описания в выдаче Авито
     for selector in (
         '[data-marker="item-description"]',
         '[class*="iva-item-descriptionStep"]',
@@ -32,7 +32,6 @@ def _extract_description(card) -> str:
             if txt:
                 return txt.strip()
 
-    # 2. Резервный поиск любого блока с "description" в имени класса
     for tag in card.find_all(["div", "p"], class_=True):
         classes = " ".join(tag.get("class", [])).lower()
         if "description" in classes:
@@ -67,30 +66,60 @@ def _extract_location(card) -> str:
 
 
 async def parse_avito_search(search_url: str, search_name: str = "", cookies_json: str | None = None) -> list[dict]:
-    """Парсит свежие объявления без использования личных cookies аккаунта."""
+    """Парсит свежие объявления с прогревом анонимной гостевой сессии (без личного аккаунта)."""
     url = _ensure_sorted_by_date(search_url.strip())
     proxies = {"http": settings.PROXY_URL, "https": settings.PROXY_URL} if settings.PROXY_URL else None
-    profile = random.choice(IMPERSONATE_PROFILES)
 
-    headers = {
+    base_headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
         "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-User": "?1",
     }
 
     try:
-        async with AsyncSession(impersonate=profile, proxies=proxies, timeout=25) as session:
-            resp = await session.get(url, headers=headers)
-            if resp.status_code == 429:
-                logger.warning("Avito вернул статус 429 (лимит IP прокси) для поиска '%s'", search_name or url)
+        async with AsyncSession(impersonate="chrome124", proxies=proxies, timeout=25) as session:
+            # Если гостевых кук ещё нет — прогреваем главную страницу Авито
+            if not _GUEST_COOKIES:
+                warm_headers = {**base_headers, "Sec-Fetch-Site": "none"}
+                warm_resp = await session.get("https://www.avito.ru/", headers=warm_headers)
+                if warm_resp.status_code in (403, 429):
+                    logger.warning(
+                        "Avito вернул статус %s при прогреве главной страницы (проблема с IP прокси)",
+                        warm_resp.status_code,
+                    )
+                    return []
+                await asyncio.sleep(random.uniform(1.5, 3.0))
+
+            search_headers = {
+                **base_headers,
+                "Referer": "https://www.avito.ru/",
+                "Sec-Fetch-Site": "same-origin",
+            }
+            resp = await session.get(url, headers=search_headers, cookies=_GUEST_COOKIES)
+
+            if resp.status_code in (403, 429):
+                _GUEST_COOKIES.clear()
+                logger.warning("Avito вернул статус %s (лимит/блок IP прокси) для поиска '%s'", resp.status_code, search_name or url)
                 return []
+
             if resp.status_code != 200:
                 logger.warning("Avito вернул статус %s для поиска '%s'", resp.status_code, search_name or url)
                 return []
+
+            try:
+                for k, v in session.cookies.items():
+                    _GUEST_COOKIES[str(k)] = str(v)
+            except Exception:
+                pass
+
             html = resp.text
     except Exception as e:
+        _GUEST_COOKIES.clear()
         logger.error("Ошибка curl_cffi при парсинге '%s': %s", search_name or url, e)
         return []
 
