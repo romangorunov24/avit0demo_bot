@@ -33,7 +33,7 @@ async def main() -> None:
     bg_task = asyncio.create_task(worker_loop(bot))
 
     try:
-        logger.info("Avito Sniper Bot (Buyer Edition) запущен и готов к работе.")
+        logger.info("Avito Sniper Pro запущен и готов к работе.")
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
