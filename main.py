@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 
 
 async def main() -> None:
+    if not settings.admin_ids_list:
+        raise SystemExit("ADMIN_IDS не задан: укажите в .env свой Telegram ID (иначе бот открыт для всех).")
+    if "PUT_YOUR" in settings.BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN не задан: впишите токен от @BotFather в .env.")
     await init_db()
     logger.info("База данных SQLite инициализирована: %s", settings.DB_PATH)
 
