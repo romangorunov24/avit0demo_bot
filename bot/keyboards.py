@@ -30,14 +30,20 @@ def cancel_kb() -> InlineKeyboardMarkup:
     )
 
 
+def skip_or_cancel_kb(skip_cb: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить", callback_data=skip_cb)],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_fsm")],
+        ]
+    )
+
+
 def searches_list_kb(searches: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for s in searches:
-        status_icon = "🟢" if s.get("is_active", True) else "⏸"
-        name = s.get("name") or f"Поиск #{s.get('id')}"
-        rows.append(
-            [InlineKeyboardButton(text=f"{status_icon} {name}", callback_data=f"search_{s['id']}")]
-        )
+        status_icon = "🟢" if s.get("is_active", 1) else "⏸"
+        rows.append([InlineKeyboardButton(text=f"{status_icon} {s['name']}", callback_data=f"search_{s['id']}")])
     rows.append([InlineKeyboardButton(text="➕ Добавить поиск", callback_data="add_search")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -59,9 +65,7 @@ def search_detail_kb(search_id: int, is_active: bool = True, auto_reply: bool = 
 
 
 def item_card_kb(item_url: str, item_id: int | str, seller_id: str | None, has_account: bool) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="🔗 Открыть на Авито", url=item_url)],
-    ]
+    rows = [[InlineKeyboardButton(text="🔗 Открыть на Авито", url=item_url)]]
     if has_account:
         action_row = [InlineKeyboardButton(text="💬 Написать ещё", callback_data=f"reply_{item_id}")]
         if seller_id:

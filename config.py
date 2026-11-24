@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     BOT_TOKEN: str
     ADMIN_IDS: str
     PROXY_URL: str | None = None
-    CHECK_INTERVAL_SEC: int = 12
+    CHECK_INTERVAL_SEC: int = 60
     DB_PATH: str = "avito_bot.db"
     AVITO_USER_ID: str | None = None
     AVITO_ACCESS_TOKEN: str | None = None

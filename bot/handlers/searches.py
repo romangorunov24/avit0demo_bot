@@ -1,294 +1,239 @@
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
-from bot.keyboards import cancel_kb, search_detail_kb, searches_list_kb
+from bot.keyboards import cancel_kb, main_menu_kb, search_detail_kb, searches_list_kb, skip_or_cancel_kb
 from bot.states import SearchStates
-from database import models
-from utils.helpers import normalize_avito_url
+from database import db
 
 router = Router()
 
 
-def _format_search_card(s: dict) -> str:
-    status = "🟢 Активен" if s["is_active"] else "⏸ На паузе"
-    price_range = (
-        f"от {s['min_price']} ₽ до {s['max_price']} ₽"
-        if (s["min_price"] or s["max_price"])
-        else "Любая"
-    )
-    sniper = (
-        f"до {s['sniper_price']} ₽"
-        if s["sniper_price"] > 0
-        else "Всем подходящим (без порога)"
-    )
-    stop_w = s["stop_words"] if s["stop_words"] else "—"
-    plus_w = s["plus_words"] if s["plus_words"] else "—"
-    priv = "Да" if s["only_private"] else "Нет"
-
+def _format_search_detail(s: dict) -> str:
+    status = "🟢 Активен" if s.get("is_active") else "⏸ На паузе"
+    reply = "🟢 Включён" if s.get("auto_reply") else "⚪️ Выключен"
+    min_p = f"{s['min_price']} ₽" if s.get("min_price") else "нет"
+    max_p = f"{s['max_price']} ₽" if s.get("max_price") else "нет"
+    stop_w = s.get("stop_words") or "нет"
+    tpl = s.get("message_template") or "По умолчанию из настроек аккаунта"
     return (
-        f"<b>🔍 Поиск: {s['name']}</b>\n"
-        f"• <b>Статус:</b> {status}\n"
-        f"• <b>Фильтр цены:</b> {price_range}\n"
-        f"• <b>Автоответ «Снайпер»:</b> {sniper}\n"
-        f"• <b>Минус-слова:</b> <code>{stop_w}</code>\n"
-        f"• <b>Плюс-слова:</b> <code>{plus_w}</code>\n"
-        f"• <b>Только частники:</b> {priv}\n"
-        f"• <b>Ссылка:</b> <a href=\"{s['url']}\">Открыть поиск</a>"
+        f"🔍 <b>Поиск: {s['name']}</b>\n\n"
+        f"Статус: {status}\n"
+        f"Автоотклик: {reply}\n"
+        f"Цена: от <b>{min_p}</b> до <b>{max_p}</b>\n"
+        f"Стоп-слова: <code>{stop_w}</code>\n"
+        f"Шаблон: <i>{tpl}</i>\n"
+        f"Ссылка: {s['url']}"
     )
 
 
-@router.callback_query(F.data == "searches:list")
-async def cb_searches_list(callback: CallbackQuery, state: FSMContext) -> None:
+@router.message(F.text == "🔍 Мои поиски")
+async def list_searches(message: Message, state: FSMContext) -> None:
     await state.clear()
-    searches = await models.get_searches()
-    text = (
-        "<b>📋 Ваши задачи мониторинга</b>\n\nНажмите на поиск, чтобы настроить фильтры и автоответ:"
-        if searches
-        else "У вас пока нет активных поисков. Нажмите кнопку ниже, чтобы добавить первый."
-    )
-    await callback.message.edit_text(text, reply_markup=searches_list_kb(searches), parse_mode="HTML")
+    searches = await db.get_user_searches(message.from_user.id)
+    if not searches:
+        await message.answer(
+            "У вас пока нет активных поисков. Нажмите <b>«➕ Добавить поиск»</b>.",
+            parse_mode="HTML",
+            reply_markup=searches_list_kb([]),
+        )
+        return
+    await message.answer("📋 <b>Ваши поиски:</b>", parse_mode="HTML", reply_markup=searches_list_kb(searches))
+
+
+@router.callback_query(F.data == "back_searches")
+async def back_to_searches(callback: CallbackQuery) -> None:
+    searches = await db.get_user_searches(callback.from_user.id)
+    await callback.message.edit_text("📋 <b>Ваши поиски:</b>", parse_mode="HTML", reply_markup=searches_list_kb(searches))
     await callback.answer()
 
 
-@router.callback_query(F.data == "searches:add")
-async def cb_add_search_start(callback: CallbackQuery, state: FSMContext) -> None:
+@router.message(F.text == "➕ Добавить поиск")
+async def start_add_search(message: Message, state: FSMContext) -> None:
+    await state.clear()
     await state.set_state(SearchStates.waiting_name)
-    await callback.message.edit_text(
-        "<b>Шаг 1/2.</b> Введите название для поиска (например: <i>iPhone 13 Pro Max Москва</i>):",
-        reply_markup=cancel_kb("searches:list"),
-        parse_mode="HTML",
-    )
+    await message.answer("1️⃣ Введите название поиска (например: <i>iPhone 15 СПб</i>):", parse_mode="HTML", reply_markup=cancel_kb())
+
+
+@router.callback_query(F.data == "add_search")
+async def cb_add_search(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(SearchStates.waiting_name)
+    await callback.message.answer("1️⃣ Введите название поиска (например: <i>iPhone 15 СПб</i>):", parse_mode="HTML", reply_markup=cancel_kb())
     await callback.answer()
 
 
 @router.message(SearchStates.waiting_name)
-async def msg_search_name(message: Message, state: FSMContext) -> None:
-    name = (message.text or "").strip()
-    if len(name) < 2:
-        await message.answer("Введите корректное название (минимум 2 символа):")
+async def step_name(message: Message, state: FSMContext) -> None:
+    if not message.text:
         return
-    await state.update_data(name=name)
+    await state.update_data(name=message.text.strip())
     await state.set_state(SearchStates.waiting_url)
-    await message.answer(
-        "<b>Шаг 2/2.</b> Отправьте ссылку с Авито (выберите нужную категорию, город и параметры на сайте, затем скопируйте URL из адресной строки):\n\n"
-        "<i>Сортировку по новизне бот подставит автоматически.</i>",
-        reply_markup=cancel_kb("searches:list"),
-        parse_mode="HTML",
-    )
+    await message.answer("2️⃣ Отправьте ссылку на поиск с сайта <b>avito.ru</b>:", parse_mode="HTML", reply_markup=cancel_kb())
 
 
 @router.message(SearchStates.waiting_url)
-async def msg_search_url(message: Message, state: FSMContext) -> None:
-    try:
-        clean_url = normalize_avito_url(message.text or "")
-    except ValueError as e:
-        await message.answer(f"❌ {e}\nПопробуйте отправить ссылку ещё раз:")
+async def step_url(message: Message, state: FSMContext) -> None:
+    if not message.text or "avito.ru" not in message.text:
+        await message.answer("❌ Нужна корректная ссылка на avito.ru. Попробуйте снова:", reply_markup=cancel_kb())
         return
-
-    data = await state.get_data()
-    search_id = await models.add_search(name=data["name"], url=clean_url)
-    await state.clear()
-    search = await models.get_search(search_id)
-    await message.answer(
-        "✅ Поиск создан! Настройте фильтры ниже:\n\n" + _format_search_card(search),
-        reply_markup=search_detail_kb(search),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-
-
-@router.callback_query(F.data.startswith("search:view:"))
-async def cb_search_view(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    sid = int(callback.data.split(":")[2])
-    search = await models.get_search(sid)
-    if not search:
-        await callback.answer("Поиск не найден", show_alert=True)
-        return
-    await callback.message.edit_text(
-        _format_search_card(search),
-        reply_markup=search_detail_kb(search),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("search:toggle:"))
-async def cb_search_toggle(callback: CallbackQuery) -> None:
-    sid = int(callback.data.split(":")[2])
-    search = await models.get_search(sid)
-    if not search:
-        return
-    new_val = 0 if search["is_active"] else 1
-    await models.update_search_field(sid, "is_active", new_val)
-    search = await models.get_search(sid)
-    await callback.message.edit_text(
-        _format_search_card(search),
-        reply_markup=search_detail_kb(search),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-    await callback.answer("Статус обновлен")
-
-
-@router.callback_query(F.data.startswith("search:private:"))
-async def cb_search_private(callback: CallbackQuery) -> None:
-    sid = int(callback.data.split(":")[2])
-    search = await models.get_search(sid)
-    if not search:
-        return
-    new_val = 0 if search["only_private"] else 1
-    await models.update_search_field(sid, "only_private", new_val)
-    search = await models.get_search(sid)
-    await callback.message.edit_text(
-        _format_search_card(search),
-        reply_markup=search_detail_kb(search),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-    await callback.answer("Фильтр частников обновлен")
-
-
-@router.callback_query(F.data.startswith("search:delete:"))
-async def cb_search_delete(callback: CallbackQuery) -> None:
-    sid = int(callback.data.split(":")[2])
-    await models.delete_search(sid)
-    searches = await models.get_searches()
-    await callback.message.edit_text(
-        "🗑 Поиск удален.\n\n<b>📋 Ваши задачи мониторинга:</b>",
-        reply_markup=searches_list_kb(searches),
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("search:price:"))
-async def cb_search_price(callback: CallbackQuery, state: FSMContext) -> None:
-    sid = int(callback.data.split(":")[2])
-    await state.update_data(edit_sid=sid)
+    await state.update_data(url=message.text.strip())
     await state.set_state(SearchStates.waiting_min_price)
-    await callback.message.edit_text(
-        "Введите <b>минимальную и максимальную</b> цену через пробел (например: <code>25000 45000</code>).\n"
-        "Чтобы сбросить ограничение, отправьте <code>0 0</code>:",
-        reply_markup=cancel_kb(f"search:view:{sid}"),
-        parse_mode="HTML",
-    )
+    await message.answer("3️⃣ Минимальная цена в рублях (числом):", reply_markup=skip_or_cancel_kb("skip_min_price"))
+
+
+@router.callback_query(F.data == "skip_min_price", SearchStates.waiting_min_price)
+async def skip_min(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(min_price=None)
+    await state.set_state(SearchStates.waiting_max_price)
+    await callback.message.answer("4️⃣ Максимальная цена в рублях (числом):", reply_markup=skip_or_cancel_kb("skip_max_price"))
     await callback.answer()
 
 
 @router.message(SearchStates.waiting_min_price)
-async def msg_search_price(message: Message, state: FSMContext) -> None:
-    parts = (message.text or "").strip().split()
-    if len(parts) != 2 or not all(p.isdigit() for p in parts):
-        await message.answer("Введите два числа через пробел, например: <code>20000 50000</code>", parse_mode="HTML")
-        return
-    data = await state.get_data()
-    sid = data["edit_sid"]
-    await models.update_search_field(sid, "min_price", int(parts[0]))
-    await models.update_search_field(sid, "max_price", int(parts[1]))
-    await state.clear()
-    search = await models.get_search(sid)
-    await message.answer(
-        _format_search_card(search),
-        reply_markup=search_detail_kb(search),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
+async def step_min(message: Message, state: FSMContext) -> None:
+    digits = "".join(c for c in (message.text or "") if c.isdigit())
+    await state.update_data(min_price=int(digits) if digits else None)
+    await state.set_state(SearchStates.waiting_max_price)
+    await message.answer("4️⃣ Максимальная цена в рублях (числом):", reply_markup=skip_or_cancel_kb("skip_max_price"))
 
 
-@router.callback_query(F.data.startswith("search:sniper:"))
-async def cb_search_sniper(callback: CallbackQuery, state: FSMContext) -> None:
-    sid = int(callback.data.split(":")[2])
-    await state.update_data(edit_sid=sid)
-    await state.set_state(SearchStates.waiting_sniper_price)
-    await callback.message.edit_text(
-        "🎯 <b>Режим «Снайпер»</b>\n"
-        "Укажите максимальную цену в рублях, при которой бот <b>автоматически напишет продавцу первым</b> "
-        "(остальные объявления просто придут вам в уведомлении).\n\n"
-        "Отправьте <code>0</code>, чтобы бот писал вообще по всем новым объявлениям из этого поиска:",
-        reply_markup=cancel_kb(f"search:view:{sid}"),
-        parse_mode="HTML",
-    )
+@router.callback_query(F.data == "skip_max_price", SearchStates.waiting_max_price)
+async def skip_max(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(max_price=None)
+    await state.set_state(SearchStates.waiting_stop_words)
+    await callback.message.answer("5️⃣ Стоп-слова через запятую (например: <i>разбит, на запчасти, копия</i>):", parse_mode="HTML", reply_markup=skip_or_cancel_kb("skip_stop_words"))
     await callback.answer()
 
 
-@router.message(SearchStates.waiting_sniper_price)
-async def msg_search_sniper(message: Message, state: FSMContext) -> None:
-    val = (message.text or "").strip()
-    if not val.isdigit():
-        await message.answer("Введите целое число (например: <code>35000</code> или <code>0</code>):", parse_mode="HTML")
-        return
-    data = await state.get_data()
-    sid = data["edit_sid"]
-    await models.update_search_field(sid, "sniper_price", int(val))
-    await state.clear()
-    search = await models.get_search(sid)
-    await message.answer(
-        _format_search_card(search),
-        reply_markup=search_detail_kb(search),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-
-
-@router.callback_query(F.data.startswith("search:stop:"))
-async def cb_search_stop(callback: CallbackQuery, state: FSMContext) -> None:
-    sid = int(callback.data.split(":")[2])
-    await state.update_data(edit_sid=sid)
+@router.message(SearchStates.waiting_max_price)
+async def step_max(message: Message, state: FSMContext) -> None:
+    digits = "".join(c for c in (message.text or "") if c.isdigit())
+    await state.update_data(max_price=int(digits) if digits else None)
     await state.set_state(SearchStates.waiting_stop_words)
-    await callback.message.edit_text(
-        "🚫 Введите <b>минус-слова</b> через запятую (например: <code>разбит, запчасти, icloud, копия, чехол</code>).\n"
-        "Чтобы очистить список, отправьте <code>-</code>:",
-        reply_markup=cancel_kb(f"search:view:{sid}"),
-        parse_mode="HTML",
-    )
+    await message.answer("5️⃣ Стоп-слова через запятую (например: <i>разбит, на запчасти, копия</i>):", parse_mode="HTML", reply_markup=skip_or_cancel_kb("skip_stop_words"))
+
+
+@router.callback_query(F.data == "skip_stop_words", SearchStates.waiting_stop_words)
+async def skip_stop(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(stop_words=None)
+    await state.set_state(SearchStates.waiting_template)
+    await callback.message.answer("6️⃣ Индивидуальный текст автоотклика для этого поиска:", reply_markup=skip_or_cancel_kb("skip_tpl"))
     await callback.answer()
 
 
 @router.message(SearchStates.waiting_stop_words)
-async def msg_search_stop(message: Message, state: FSMContext) -> None:
-    raw = (message.text or "").strip()
-    clean = "" if raw == "-" else ", ".join(w.strip().lower() for w in raw.split(",") if w.strip())
+async def step_stop(message: Message, state: FSMContext) -> None:
+    await state.update_data(stop_words=(message.text or "").strip() or None)
+    await state.set_state(SearchStates.waiting_template)
+    await message.answer("6️⃣ Индивидуальный текст автоотклика для этого поиска:", reply_markup=skip_or_cancel_kb("skip_tpl"))
+
+
+@router.callback_query(F.data == "skip_tpl", SearchStates.waiting_template)
+async def finish_skip_tpl(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
-    sid = data["edit_sid"]
-    await models.update_search_field(sid, "stop_words", clean)
-    await state.clear()
-    search = await models.get_search(sid)
-    await message.answer(
-        _format_search_card(search),
-        reply_markup=search_detail_kb(search),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
+    await db.add_search(
+        user_id=callback.from_user.id,
+        name=data["name"],
+        url=data["url"],
+        min_price=data.get("min_price"),
+        max_price=data.get("max_price"),
+        stop_words=data.get("stop_words"),
+        message_template=None,
     )
+    await state.clear()
+    await callback.message.answer(f"✅ Поиск <b>«{data['name']}»</b> создан и запущен!", parse_mode="HTML", reply_markup=main_menu_kb())
+    await callback.answer()
 
 
-@router.callback_query(F.data.startswith("search:plus:"))
-async def cb_search_plus(callback: CallbackQuery, state: FSMContext) -> None:
-    sid = int(callback.data.split(":")[2])
-    await state.update_data(edit_sid=sid)
-    await state.set_state(SearchStates.waiting_plus_words)
+@router.message(SearchStates.waiting_template)
+async def finish_with_tpl(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await db.add_search(
+        user_id=message.from_user.id,
+        name=data["name"],
+        url=data["url"],
+        min_price=data.get("min_price"),
+        max_price=data.get("max_price"),
+        stop_words=data.get("stop_words"),
+        message_template=(message.text or "").strip() or None,
+    )
+    await state.clear()
+    await message.answer(f"✅ Поиск <b>«{data['name']}»</b> создан и запущен!", parse_mode="HTML", reply_markup=main_menu_kb())
+
+
+@router.callback_query(F.data.startswith("search_"))
+async def open_search_detail(callback: CallbackQuery) -> None:
+    search_id = int(callback.data.split("_")[1])
+    s = await db.get_search_by_id(search_id)
+    if not s:
+        await callback.answer("Поиск не найден", show_alert=True)
+        return
     await callback.message.edit_text(
-        "✅ Введите <b>обязательные плюс-слова</b> через запятую (объявление подойдет, если в нем есть хотя бы одно из слов, например: <code>оригинал, идеал, не вскрывался</code>).\n"
-        "Чтобы очистить список, отправьте <code>-</code>:",
-        reply_markup=cancel_kb(f"search:view:{sid}"),
+        _format_search_detail(s),
         parse_mode="HTML",
+        reply_markup=search_detail_kb(search_id, bool(s["is_active"]), bool(s["auto_reply"])),
+        disable_web_page_preview=True,
     )
     await callback.answer()
 
 
-@router.message(SearchStates.waiting_plus_words)
-async def msg_search_plus(message: Message, state: FSMContext) -> None:
-    raw = (message.text or "").strip()
-    clean = "" if raw == "-" else ", ".join(w.strip().lower() for w in raw.split(",") if w.strip())
+@router.callback_query(F.data.startswith("toggle_search_"))
+async def toggle_search(callback: CallbackQuery) -> None:
+    search_id = int(callback.data.split("_")[2])
+    s = await db.get_search_by_id(search_id)
+    if s:
+        new_val = 0 if s["is_active"] else 1
+        await db.update_search_field(search_id, "is_active", new_val)
+        s["is_active"] = new_val
+        await callback.message.edit_text(
+            _format_search_detail(s),
+            parse_mode="HTML",
+            reply_markup=search_detail_kb(search_id, bool(s["is_active"]), bool(s["auto_reply"])),
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("toggle_reply_"))
+async def toggle_reply(callback: CallbackQuery) -> None:
+    search_id = int(callback.data.split("_")[2])
+    s = await db.get_search_by_id(search_id)
+    if s:
+        new_val = 0 if s["auto_reply"] else 1
+        await db.update_search_field(search_id, "auto_reply", new_val)
+        s["auto_reply"] = new_val
+        await callback.message.edit_text(
+            _format_search_detail(s),
+            parse_mode="HTML",
+            reply_markup=search_detail_kb(search_id, bool(s["is_active"]), bool(s["auto_reply"])),
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("edit_tpl_"))
+async def start_edit_tpl(callback: CallbackQuery, state: FSMContext) -> None:
+    search_id = int(callback.data.split("_")[2])
+    await state.set_state(SearchStates.waiting_edit_template)
+    await state.update_data(edit_search_id=search_id)
+    await callback.message.answer("✏️ Отправьте новый шаблон сообщения для этого поиска:", reply_markup=cancel_kb())
+    await callback.answer()
+
+
+@router.message(SearchStates.waiting_edit_template)
+async def save_edited_tpl(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    sid = data["edit_sid"]
-    await models.update_search_field(sid, "plus_words", clean)
+    search_id = data.get("edit_search_id")
+    if search_id and message.text:
+        await db.update_search_field(search_id, "message_template", message.text.strip())
     await state.clear()
-    search = await models.get_search(sid)
-    await message.answer(
-        _format_search_card(search),
-        reply_markup=search_detail_kb(search),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
+    await message.answer("✅ Шаблон поиска обновлён!", reply_markup=main_menu_kb())
+
+
+@router.callback_query(F.data.startswith("del_search_"))
+async def del_search(callback: CallbackQuery) -> None:
+    search_id = int(callback.data.split("_")[2])
+    await db.delete_search(search_id)
+    searches = await db.get_user_searches(callback.from_user.id)
+    await callback.message.edit_text("🗑 Поиск удалён.", reply_markup=searches_list_kb(searches))
+    await callback.answer()

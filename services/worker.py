@@ -11,6 +11,14 @@ from services.spintax import render_spintax
 logger = logging.getLogger(__name__)
 
 
+def _has_stop_words(text: str, stop_words_raw: str | None) -> bool:
+    if not stop_words_raw:
+        return False
+    low = text.lower()
+    words = [w.strip().lower() for w in stop_words_raw.split(",") if w.strip()]
+    return any(w in low for w in words)
+
+
 async def worker_loop(bot: Bot) -> None:
     logger.info("Фоновый мониторинг Авито запущен (интервал: %s сек.)", settings.CHECK_INTERVAL_SEC)
     messenger = AvitoMessenger()
@@ -28,15 +36,15 @@ async def worker_loop(bot: Bot) -> None:
                 cookies_raw = (user_settings or {}).get("avito_cookies")
                 has_account = bool(normalize_cookies(cookies_raw or ""))
 
-                items = await parse_avito_search(url, cookies_json=cookies_raw)
+                items = await parse_avito_search(url, search_name=title, cookies_json=cookies_raw)
                 if not items:
                     await asyncio.sleep(2)
                     continue
 
-                is_initialized = await db.is_search_initialized(search_id)
-                if not is_initialized:
+                if not await db.is_search_initialized(search_id):
                     for item in items:
                         await db.mark_item_seen(search_id, str(item["id"]))
+                    await db.update_search_field(search_id, "is_initialized", 1)
                     logger.info("Поиск '%s' инициализирован: сохранено %d стартовых объявлений.", title, len(items))
                     await asyncio.sleep(2)
                     continue
@@ -60,11 +68,12 @@ async def worker_loop(bot: Bot) -> None:
                     if max_price and price and price > max_price:
                         continue
 
-                    # Автоотклик запускается ТОЛЬКО если у пользователя привязан аккаунт и включён автоотклик
-                    auto_reply_status = ""
-                    auto_reply_enabled = bool(search.get("auto_reply", True))
+                    full_text = f"{item.get('title', '')} {item.get('description', '')}"
+                    if _has_stop_words(full_text, search.get("stop_words")):
+                        continue
 
-                    if has_account and auto_reply_enabled:
+                    auto_reply_status = ""
+                    if has_account and bool(search.get("auto_reply", 1)):
                         raw_tpl = (
                             search.get("message_template")
                             or (user_settings or {}).get("default_template")
@@ -116,8 +125,7 @@ async def worker_loop(bot: Bot) -> None:
                                 reply_markup=kb,
                                 disable_web_page_preview=True,
                             )
-                    except Exception as send_err:
-                        logger.warning("Ошибка отправки фото, шлю текстом: %s", send_err)
+                    except Exception:
                         await bot.send_message(
                             chat_id=user_id,
                             text=caption,

@@ -8,7 +8,6 @@ logger = logging.getLogger(__name__)
 
 
 def normalize_cookies(raw_cookies: str | list[dict[str, Any]]) -> dict[str, str]:
-    """Извлекает только рабочие куки Авито из JSON-списка, словаря или строки Cookie."""
     important_keys = {"u", "v", "sessid", "srv_id", "ft", "auth", "f"}
     result: dict[str, str] = {}
 
@@ -20,7 +19,6 @@ def normalize_cookies(raw_cookies: str | list[dict[str, Any]]) -> dict[str, str]
                 return normalize_cookies(parsed)
             except json.JSONDecodeError:
                 pass
-        # Поддержка вставки строкой вида "u=...; v=...; sessid=..."
         for part in text.split(";"):
             if "=" in part:
                 k, v = part.strip().split("=", 1)
@@ -67,7 +65,6 @@ class AvitoMessenger:
         return headers
 
     async def check_session(self, cookies_json: str | None, access_token: str | None = None) -> tuple[bool, str]:
-        """Проверяет валидность привязанных cookies или токена Авито."""
         cookies = normalize_cookies(cookies_json or "")
         if not cookies and not access_token:
             return False, "Не найдены ключевые cookies Авито (u, v, sessid)."
@@ -87,8 +84,7 @@ class AvitoMessenger:
                     name = data.get("name") or data.get("user", {}).get("name") or "Профиль Avito"
                     return True, f"Аккаунт подключён: {name}"
                 if resp.status_code in (401, 403):
-                    return False, "Сессия недействительна или устарела. Войдите в Avito заново и обновите данные."
-                # Если short-профиль временно недоступен, но куки u и sessid на месте
+                    return False, "Сессия недействительна или устарела. Войдите в Avito заново."
                 if "sessid" in cookies and "u" in cookies:
                     return True, "Ключевые cookies (u, sessid) сохранены."
                 return False, f"Avito вернул статус {resp.status_code} при проверке профиля."
@@ -106,12 +102,11 @@ class AvitoMessenger:
         cookies_json: str | None = None,
         access_token: str | None = None,
     ) -> tuple[bool, str]:
-        """Создаёт чат по объявлению и отправляет первое сообщение продавцу."""
         cookies = normalize_cookies(cookies_json or "")
         token = access_token or settings.AVITO_ACCESS_TOKEN
 
         if not cookies and not token:
-            return False, "NO_ACCOUNT"
+            return False, "Аккаунт не привязан"
 
         try:
             numeric_item_id = int(str(item_id).strip())
@@ -122,15 +117,12 @@ class AvitoMessenger:
         headers = self._build_headers(item_url, token)
 
         async with AsyncSession(impersonate="chrome124", proxies=proxies, timeout=25) as session:
-            # Шаг 1: Прогрев страницы объявления для получения актуального X-Xsrf / контекста
             try:
                 await session.get(item_url, cookies=cookies, headers={"Referer": "https://www.avito.ru/"})
             except Exception:
                 pass
 
-            # Шаг 2: Пробуем актуальные эндпоинты создания канала и отправки сообщения
             endpoints = [
-                # Актуальный Web Messenger API v1/v2
                 (
                     "https://www.avito.ru/web/1/messenger/createChannelByItemId",
                     {"itemId": numeric_item_id},
@@ -141,7 +133,6 @@ class AvitoMessenger:
                     {"itemId": numeric_item_id},
                     "channel",
                 ),
-                # Прямая отправка сообщения в одном запросе (новый формат)
                 (
                     f"https://www.avito.ru/web/1/items/{numeric_item_id}/messenger/send",
                     {"message": {"text": text}, "type": "text"},
@@ -185,10 +176,9 @@ class AvitoMessenger:
                 if last_status == 404:
                     return False, "Продавец закрыл сообщения или объявление уже снято (404)."
                 if last_status == 439:
-                    return False, "Антибот-лимит Авито (439) при отправке. Попробуйте позже."
-                return False, f"Не удалось открыть диалог с продавцом (HTTP {last_status or 'ERR'})."
+                    return False, "Антибот-лимит Авито (439) при отправке."
+                return False, f"Не удалось открыть диалог (HTTP {last_status or 'ERR'})."
 
-            # Шаг 3: Отправляем текст в созданный канал
             send_endpoints = [
                 (
                     "https://www.avito.ru/web/1/messenger/sendTextMessage",
@@ -210,6 +200,8 @@ class AvitoMessenger:
                     logger.debug("Ошибка отправки текста в %s: %s", send_url, e)
 
             return False, f"Чат открыт, но текст не доставлен (HTTP {last_status or 'ERR'})."
+
+
 async def send_first_message(
     item_id: int | str,
     text: str,
@@ -219,7 +211,6 @@ async def send_first_message(
     access_token: str | None = None,
     **kwargs: Any,
 ) -> tuple[bool, str]:
-    """Совместимая функция-обёртка для вызова из bot/handlers/actions.py."""
     messenger = AvitoMessenger()
     target_url = item_url or f"https://www.avito.ru/items/{item_id}"
     raw_cookies = cookies_json or cookies

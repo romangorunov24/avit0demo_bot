@@ -1,5 +1,4 @@
 import json
-import logging
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
@@ -8,7 +7,6 @@ from bot.states import AccountStates
 from database import db
 from services.avito_messenger import AvitoMessenger, normalize_cookies
 
-logger = logging.getLogger(__name__)
 router = Router()
 
 
@@ -35,11 +33,7 @@ async def show_account_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
     user_data = await db.get_user_settings(message.from_user.id)
     has_acc = bool(normalize_cookies((user_data or {}).get("avito_cookies") or ""))
-    await message.answer(
-        _format_account_text(user_data),
-        parse_mode="HTML",
-        reply_markup=account_menu_kb(has_acc),
-    )
+    await message.answer(_format_account_text(user_data), parse_mode="HTML", reply_markup=account_menu_kb(has_acc))
 
 
 @router.callback_query(F.data == "acc_menu_open")
@@ -47,11 +41,7 @@ async def open_account_from_card(callback: CallbackQuery, state: FSMContext) -> 
     await state.clear()
     user_data = await db.get_user_settings(callback.from_user.id)
     has_acc = bool(normalize_cookies((user_data or {}).get("avito_cookies") or ""))
-    await callback.message.answer(
-        _format_account_text(user_data),
-        parse_mode="HTML",
-        reply_markup=account_menu_kb(has_acc),
-    )
+    await callback.message.answer(_format_account_text(user_data), parse_mode="HTML", reply_markup=account_menu_kb(has_acc))
     await callback.answer()
 
 
@@ -67,11 +57,11 @@ async def connect_pc_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AccountStates.waiting_cookies_pc)
     text = (
         "💻 <b>Подключение через компьютер (3 шага)</b>\n\n"
-        "1. Откройте <b>avito.ru</b> в браузере (Chrome / Яндекс) и войдите в свой аккаунт.\n"
-        "2. Установите бесплатное расширение <b>Cookie-Editor</b>, нажмите на него на странице Авито → "
+        "1. Откройте <b>avito.ru</b> в браузере (Chrome / Яндекс) и войдите в аккаунт.\n"
+        "2. Установите расширение <b>Cookie-Editor</b>, нажмите на него на странице Авито → "
         "<b>Export → Export as JSON</b>.\n"
-        "3. Сохраните текст в файл <code>cookies.json</code> (через Блокнот) и <b>отправьте этот файл сюда документом</b> "
-        "(или вставьте текстом — я сам вырежу всё лишнее).\n\n"
+        "3. Сохраните текст в файл <code>cookies.json</code> и <b>отправьте этот файл сюда документом</b> "
+        "(или вставьте текстом - я сам вырежу всё лишнее).\n\n"
         "⚠️ <i>После экспорта не нажимайте «Выйти» на сайте Авито, просто закройте вкладку.</i>"
     )
     await callback.message.answer(text, parse_mode="HTML", reply_markup=cancel_kb())
@@ -82,10 +72,9 @@ async def connect_pc_start(callback: CallbackQuery, state: FSMContext) -> None:
 async def process_pc_cookies(message: Message, state: FSMContext) -> None:
     raw_text = ""
 
-    # Поддержка загрузки файла cookies.json документом (решает проблему лимита 4096 символов)
     if message.document:
         if message.document.file_size and message.document.file_size > 512 * 1024:
-            await message.answer("❌ Файл слишком большой (максимум 512 КБ). Отправьте файл cookies.json.")
+            await message.answer("❌ Файл слишком большой (максимум 512 КБ).")
             return
         file = await message.bot.get_file(message.document.file_id)
         downloaded = await message.bot.download_file(file.file_path)
@@ -99,9 +88,8 @@ async def process_pc_cookies(message: Message, state: FSMContext) -> None:
     cleaned = normalize_cookies(raw_text)
     if not cleaned or ("sessid" not in cleaned and "u" not in cleaned):
         await message.answer(
-            "❌ Не удалось найти авторизационные ключи Авито (<code>sessid</code> и <code>u</code>).\n"
-            "Убедитесь, что вы экспортировали cookies именно со страницы <b>avito.ru</b> после входа в аккаунт, "
-            "и отправьте файл <code>cookies.json</code> повторно:",
+            "❌ Не удалось найти ключи Авито (<code>sessid</code> и <code>u</code>).\n"
+            "Экспортируйте cookies именно со страницы <b>avito.ru</b> после входа в аккаунт и отправьте файл <code>cookies.json</code>:",
             parse_mode="HTML",
             reply_markup=cancel_kb(),
         )
@@ -128,11 +116,10 @@ async def connect_mobile_start(callback: CallbackQuery, state: FSMContext) -> No
     await state.set_state(AccountStates.waiting_mobile_session)
     text = (
         "📱 <b>Подключение с телефона (без компьютера)</b>\n\n"
-        "На телефоне (Android или iPhone) удобнее всего подключить аккаунт через мобильный браузер с поддержкой расширений:\n\n"
         "1. Установите браузер <b>Kiwi Browser</b> (Android) или <b>Orion Browser</b> (iPhone).\n"
         "2. Войдите в нём на сайт <b>avito.ru</b>.\n"
-        "3. Установите расширение <b>Cookie-Editor</b>, нажмите <b>Export</b> и вставьте скопированный текст прямо в этот чат "
-        "(или отправьте только строку вида <code>sessid=...; u=...; v=...</code>).\n\n"
+        "3. Установите расширение <b>Cookie-Editor</b>, нажмите <b>Export</b> и вставьте скопированный текст сюда "
+        "(или отправьте строку вида <code>sessid=...; u=...; v=...</code>).\n\n"
         "Отправьте данные сессии в ответном сообщении:"
     )
     await callback.message.answer(text, parse_mode="HTML", reply_markup=cancel_kb())
@@ -141,10 +128,6 @@ async def connect_mobile_start(callback: CallbackQuery, state: FSMContext) -> No
 
 @router.message(AccountStates.waiting_mobile_session)
 async def process_mobile_session(message: Message, state: FSMContext) -> None:
-    if not message.text and not message.document:
-        await message.answer("Отправьте текст сессии или файл cookies.json.", reply_markup=cancel_kb())
-        return
-    # Используем тот же универсальный обработчик с автоочисткой
     await process_pc_cookies(message, state)
 
 
@@ -153,7 +136,7 @@ async def check_account_handler(callback: CallbackQuery) -> None:
     user_data = await db.get_user_settings(callback.from_user.id)
     cookies_raw = (user_data or {}).get("avito_cookies")
     messenger = AvitoMessenger()
-    ok, info = await messenger.check_session(cookies_raw)
+    _, info = await messenger.check_session(cookies_raw)
     await callback.answer(info[:190], show_alert=True)
 
 
@@ -161,11 +144,7 @@ async def check_account_handler(callback: CallbackQuery) -> None:
 async def disconnect_account_handler(callback: CallbackQuery) -> None:
     await db.save_user_cookies(callback.from_user.id, None)
     user_data = await db.get_user_settings(callback.from_user.id)
-    await callback.message.edit_text(
-        _format_account_text(user_data),
-        parse_mode="HTML",
-        reply_markup=account_menu_kb(False),
-    )
+    await callback.message.edit_text(_format_account_text(user_data), parse_mode="HTML", reply_markup=account_menu_kb(False))
     await callback.answer("Аккаунт Avito отвязан")
 
 
@@ -173,7 +152,7 @@ async def disconnect_account_handler(callback: CallbackQuery) -> None:
 async def set_template_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AccountStates.waiting_default_template)
     await callback.message.answer(
-        "✏️ Введите текст сообщения по умолчанию, который бот будет отправлять продавцам.\n"
+        "✏️ Введите текст сообщения по умолчанию.\n"
         "Поддерживается спинтакс: <code>{Здравствуйте|Добрый день}! {Актуально|Ещё продаёте}?</code>",
         parse_mode="HTML",
         reply_markup=cancel_kb(),
@@ -184,7 +163,6 @@ async def set_template_start(callback: CallbackQuery, state: FSMContext) -> None
 @router.message(AccountStates.waiting_default_template)
 async def save_template_handler(message: Message, state: FSMContext) -> None:
     if not message.text:
-        await message.answer("Отправьте текстовое сообщение.", reply_markup=cancel_kb())
         return
     await db.save_default_template(message.from_user.id, message.text.strip())
     await state.clear()
