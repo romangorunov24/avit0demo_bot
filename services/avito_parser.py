@@ -18,6 +18,54 @@ def _ensure_sorted_by_date(url: str) -> str:
     return f"{url}{sep}s=104"
 
 
+def _extract_description(card) -> str:
+    # 1. Прямые маркеры и актуальные классы описания в выдаче Авито
+    for selector in (
+        '[data-marker="item-description"]',
+        '[class*="iva-item-descriptionStep"]',
+        '[class*="item-description"]',
+        'meta[itemprop="description"]',
+    ):
+        el = card.select_one(selector)
+        if el:
+            txt = el.get("content") or el.get_text(" ", strip=True)
+            if txt:
+                return txt.strip()
+
+    # 2. Резервный поиск любого блока с "description" в имени класса
+    for tag in card.find_all(["div", "p"], class_=True):
+        classes = " ".join(tag.get("class", [])).lower()
+        if "description" in classes:
+            txt = tag.get_text(" ", strip=True)
+            if txt:
+                return txt.strip()
+
+    return ""
+
+
+def _extract_location(card) -> str:
+    for selector in (
+        '[data-marker="item-location"]',
+        '[data-marker="item-address"]',
+        '[class*="geo-address"]',
+        '[class*="geo-root"]',
+    ):
+        el = card.select_one(selector)
+        if el:
+            txt = el.get_text(" ", strip=True)
+            if txt:
+                return txt.strip()
+
+    for tag in card.find_all(["div", "span"], class_=True):
+        classes = " ".join(tag.get("class", [])).lower()
+        if "geo-" in classes:
+            txt = tag.get_text(" ", strip=True)
+            if txt:
+                return txt.strip()
+
+    return "Не указано"
+
+
 async def parse_avito_search(search_url: str, search_name: str = "", cookies_json: str | None = None) -> list[dict]:
     """Парсит свежие объявления без использования личных cookies аккаунта."""
     url = _ensure_sorted_by_date(search_url.strip())
@@ -80,14 +128,8 @@ async def parse_avito_search(search_url: str, search_name: str = "", cookies_jso
                 if digits:
                     price_val = int(digits)
 
-        desc_el = card.select_one('meta[itemprop="description"], [class*="item-description"]')
-        if desc_el:
-            description = desc_el.get("content") or desc_el.get_text(" ", strip=True)
-        else:
-            description = ""
-
-        loc_el = card.select_one('[data-marker="item-location"], [class*="geo-root"]')
-        location = loc_el.get_text(" ", strip=True) if loc_el else "Не указано"
+        description = _extract_description(card)
+        location = _extract_location(card)
 
         img_el = card.select_one("img")
         image_url = None
