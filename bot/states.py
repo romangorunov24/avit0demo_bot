@@ -16,4 +16,5 @@ class AccountStates(StatesGroup):
 
 
 class ActionStates(StatesGroup):
+    waiting_custom_message = State()
     waiting_custom_reply = State()
