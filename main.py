@@ -3,7 +3,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from bot.handlers import actions, searches, settings as settings_handler, start
-from bot.middlewares import AccessMiddleware
+from bot.middlewares import AccessMiddleware, MenuResetMiddleware
 from config import settings
 from database.db import init_db
 from services.worker import worker_loop
@@ -26,6 +26,7 @@ async def main() -> None:
     bot = Bot(token=settings.BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
 
+    dp.message.outer_middleware(MenuResetMiddleware())
     dp.message.middleware(AccessMiddleware())
     dp.callback_query.middleware(AccessMiddleware())
 
@@ -35,6 +36,12 @@ async def main() -> None:
     dp.include_router(actions.router)
 
     bg_task = asyncio.create_task(worker_loop(bot))
+
+    def _worker_done(task: asyncio.Task) -> None:
+        if not task.cancelled() and task.exception():
+            logger.critical("Фоновый мониторинг аварийно остановился: %r. Перезапустите бота.", task.exception())
+
+    bg_task.add_done_callback(_worker_done)
 
     try:
         logger.info("Avito Sniper Pro запущен и готов к работе.")

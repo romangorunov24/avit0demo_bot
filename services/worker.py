@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TEMPLATE = "{Здравствуйте|Добрый день}! {Объявление ещё актуально|Ещё продаёте}? Готов забрать сегодня."
 
+MAX_SEND_ATTEMPTS = 3            # попыток отправки одного отклика при безопасных сбоях (сеть, 5xx до отправки текста)
+RATE_LIMIT_PAUSE_SEC = 30 * 60   # пауза автоотклика после ответа Авито 429
+PHOTO_CAPTION_LIMIT = 1024       # лимит Telegram на подпись к фото
+_AUTO_PAUSE_UNTIL: dict[int, float] = {}
+
 
 def build_item_caption(
     item: dict,
@@ -23,6 +28,7 @@ def build_item_caption(
     ready_msg: str,
     is_sniper_hit: bool = False,
     auto_reply_note: str = "",
+    desc_limit: int = 260,
 ) -> str:
     price = item.get("price")
     price_str = f"{price:,} ₽".replace(",", " ") if price else "Не указана"
@@ -36,7 +42,7 @@ def build_item_caption(
     safe_title = html.escape(item.get("title") or "Без названия")
     safe_loc = html.escape(item.get("location") or "Не указано")
     safe_seller = html.escape(item.get("seller_type") or "Частное лицо")
-    safe_desc = html.escape((item.get("description") or "Описание отсутствует")[:260])
+    safe_desc = html.escape((item.get("description") or "Описание отсутствует")[:desc_limit])
     safe_msg = html.escape(ready_msg)
 
     return (
@@ -79,6 +85,14 @@ async def _try_auto_reply(user_id: int, item: dict, ready_msg: str, user_setting
     if not normalize_cookies(cookies_raw or ""):
         return False, "\n\n⚪️ <i>Автоотклик пропущен: аккаунт Avito не привязан.</i>"
 
+    # Сообщение по этому лоту уже ушло (например, карточку в Telegram не удалось доставить с первого раза)
+    if await db.was_item_messaged(user_id, item_id):
+        return True, "\n\n✅ <i>Автоотклик по этому объявлению уже был отправлен ранее.</i>"
+
+    pause_left = _AUTO_PAUSE_UNTIL.get(user_id, 0.0) - time.time()
+    if pause_left > 0:
+        return False, f"\n\n⏸ <i>Автоотклик на паузе после лимита Авито ещё ~{int(pause_left // 60) + 1} мин.</i>"
+
     reason = await check_send_allowed(user_id, item_id, seller_id, user_settings)
     if reason:
         return False, f"\n\n🛡 <i>Антиспам: {html.escape(reason)}.</i>"
@@ -88,12 +102,18 @@ async def _try_auto_reply(user_id: int, item: dict, ready_msg: str, user_setting
     await asyncio.sleep(random.uniform(d_min, d_max))
 
     messenger = AvitoMessenger()
-    sent_ok, info, security_alert = await messenger.send_message(
-        item_id=item_id,
-        item_url=item["url"],
-        text=ready_msg,
-        cookies_json=cookies_raw,
-    )
+    outcome = None
+    for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
+        outcome = await messenger.send_message_ex(
+            item_id=item_id,
+            item_url=item["url"],
+            text=ready_msg,
+            cookies_json=cookies_raw,
+        )
+        if outcome.ok or not outcome.retryable or attempt == MAX_SEND_ATTEMPTS:
+            break
+        logger.info("Автоотклик по %s: попытка %d не удалась (%s), повторяю", item_id, attempt, outcome.info)
+        await asyncio.sleep(random.uniform(5.0, 10.0))
 
     await db.log_sent_message(
         user_id=user_id,
@@ -101,17 +121,23 @@ async def _try_auto_reply(user_id: int, item: dict, ready_msg: str, user_setting
         seller_id=seller_id,
         item_title=item.get("title") or "",
         message_text=ready_msg,
-        status="sent" if sent_ok else "failed",
+        status="sent" if outcome.ok else "failed",
+        info=outcome.info,
     )
 
-    if security_alert:
-        await db.update_user_field(user_id, "auto_reply_enabled", 0)
-        return False, f"\n\n🚨 <b>{html.escape(info)} Автоотклик выключен в настройках!</b>"
+    if outcome.rate_limited:
+        _AUTO_PAUSE_UNTIL[user_id] = time.time() + RATE_LIMIT_PAUSE_SEC
+        logger.warning("Авито ответил 429: автоотклик пользователя %s на паузе %d мин.", user_id, RATE_LIMIT_PAUSE_SEC // 60)
 
-    if sent_ok:
+    if outcome.security_alert:
+        await db.update_user_field(user_id, "auto_reply_enabled", 0)
+        user_settings["auto_reply_enabled"] = 0  # настройки общие для всех лотов прохода: остальные лоты тоже не пишем
+        return False, f"\n\n🚨 <b>{html.escape(outcome.info)} Автоотклик выключен в настройках!</b>"
+
+    if outcome.ok:
         return True, "\n\n✅ <b>Автоотклик отправлен продавцу в Avito!</b>"
 
-    return False, f"\n\n⚠️ <i>Автоотклик не ушёл: {html.escape(info)}</i>"
+    return False, f"\n\n⚠️ <i>Автоотклик не ушёл: {html.escape(outcome.info)}</i>"
 
 
 async def send_item_card(
@@ -141,30 +167,39 @@ async def send_item_card(
     if should_auto:
         sent_auto, auto_reply_note = await _try_auto_reply(user_id, item, ready_msg, user_settings)
 
-    await db.save_recent_item(item, search["name"])
-    caption = build_item_caption(
-        item,
-        search["name"],
-        ready_msg,
-        is_sniper_hit=is_sniper_hit,
-        auto_reply_note=auto_reply_note,
-    )
+    await db.save_recent_item(item, search["name"], search.get("id"))
+    await db.save_draft(user_id, item_id, ready_msg)
+
+    def make_caption(desc_limit: int) -> str:
+        return build_item_caption(
+            item,
+            search["name"],
+            ready_msg,
+            is_sniper_hit=is_sniper_hit,
+            auto_reply_note=auto_reply_note,
+            desc_limit=desc_limit,
+        )
+
+    caption = make_caption(260)
     has_acc = bool(normalize_cookies(user_settings.get("avito_cookies") or ""))
     kb = item_card_kb(item["url"], item_id, item.get("seller_id"), can_send_now=(has_acc and not sent_auto))
 
-    try:
-        if item.get("image_url"):
-            await bot.send_photo(
-                chat_id=user_id,
-                photo=item["image_url"],
-                caption=caption,
-                parse_mode="HTML",
-                reply_markup=kb,
-                disable_notification=silent,
-            )
-            return
-    except Exception:
-        pass
+    if item.get("image_url"):
+        # У подписи к фото лимит 1024 символа: сокращаем описание, а если не помогло, шлём текстом без фото
+        photo_caption = caption if len(caption) <= PHOTO_CAPTION_LIMIT else make_caption(60)
+        if len(photo_caption) <= PHOTO_CAPTION_LIMIT:
+            try:
+                await bot.send_photo(
+                    chat_id=user_id,
+                    photo=item["image_url"],
+                    caption=photo_caption,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                    disable_notification=silent,
+                )
+                return
+            except Exception as e:
+                logger.info("Фото лота %s не отправилось (%s), шлю карточку текстом", item_id, str(e)[:100])
 
     await bot.send_message(
         chat_id=user_id,
@@ -274,7 +309,8 @@ async def process_single_search(bot: Bot, search: dict, force_preview: bool = Fa
 
 
 async def worker_loop(bot: Bot) -> None:
-    logger.info("Фоновый мониторинг запущен (базовый интервал: %s сек.)", settings.CHECK_INTERVAL_SEC)
+    interval = max(30, int(settings.CHECK_INTERVAL_SEC))
+    logger.info("Фоновый мониторинг запущен (базовый интервал: %s сек.)", interval)
     last_prune = 0.0
     while True:
         try:
@@ -299,4 +335,4 @@ async def worker_loop(bot: Bot) -> None:
                 logger.error("Очистка старых данных не удалась: %s", e)
 
         jitter = random.uniform(4.0, 16.0)
-        await asyncio.sleep(settings.CHECK_INTERVAL_SEC + jitter)
+        await asyncio.sleep(interval + jitter)

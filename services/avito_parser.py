@@ -4,6 +4,7 @@ import random
 import re
 import statistics
 import time
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 from services.proxy_helper import get_proxy_candidates
@@ -16,10 +17,19 @@ _BACKOFF_UNTIL: float = 0.0
 
 
 def _ensure_sorted_by_date(url: str) -> str:
-    if "s=104" in url:
-        return url
-    sep = "&" if "?" in url else "?"
-    return f"{url}{sep}s=104"
+    """Для мониторинга нужна сортировка «по дате» (s=104). Чужое значение s заменяем, а не дублируем."""
+    parsed = urlparse(url)
+    pairs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k != "s"]
+    pairs.append(("s", "104"))
+    return urlunparse(parsed._replace(query=urlencode(pairs)))
+
+
+_BLOCK_MARKERS = ("captcha", "firewall", "доступ ограничен", "проблема с ip", "подозрительная активность")
+
+
+def _looks_blocked(page: str) -> bool:
+    low = (page or "")[:20000].lower()
+    return any(m in low for m in _BLOCK_MARKERS)
 
 
 def _extract_description(card) -> str:
@@ -154,6 +164,19 @@ async def parse_avito_search(search_url: str, search_name: str = "", ignore_back
     soup = BeautifulSoup(html, "lxml")
     cards = soup.select('[data-marker="item"]')
     items: list[dict] = []
+
+    if not cards:
+        if _looks_blocked(html):
+            _BACKOFF_UNTIL = time.time() + 180
+            _GUEST_COOKIES.clear()
+            logger.warning("Avito показал страницу защиты/капчу для '%s' (пауза парсера 3 мин.). Проверьте IP/прокси.", search_name or url)
+        else:
+            logger.warning(
+                "В выдаче '%s' не найдено карточек (страница %d байт). Поиск пуст или Авито изменил разметку.",
+                search_name or url,
+                len(html),
+            )
+        return []
 
     for card in cards:
         item_id = card.get("data-item-id")

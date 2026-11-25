@@ -21,6 +21,11 @@ async def init_db() -> None:
     default_admin = settings.admin_ids_list[0] if settings.admin_ids_list else 0
 
     async with aiosqlite.connect(DB_FILE) as db:
+        try:
+            # WAL: чтение и запись из бота и фонового воркера не блокируют друг друга
+            await db.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -121,6 +126,16 @@ async def init_db() -> None:
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS drafts (
+                user_id INTEGER NOT NULL,
+                item_id TEXT NOT NULL,
+                text TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, item_id)
+            )
+        """)
+
         # Безопасные миграции существующей БД
         await _ensure_column(db, "users", "bargain_template", "TEXT DEFAULT '{Здравствуйте|Добрый день}! За {price_bargain} ₽ отдадите, если подъеду сегодня?'")
         await _ensure_column(db, "users", "delivery_template", "TEXT DEFAULT '{Здравствуйте|Добрый день}! Авито Доставкой сможете отправить?'")
@@ -150,6 +165,8 @@ async def init_db() -> None:
         await _ensure_column(db, "searches", "city", "TEXT")
         await _ensure_column(db, "searches", "memory", "TEXT")
         await _ensure_column(db, "recent_items", "seller_id", "TEXT")
+        await _ensure_column(db, "recent_items", "search_id", "INTEGER")
+        await _ensure_column(db, "sent_messages", "info", "TEXT")
         await _ensure_column(db, "blacklist", "user_id", f"INTEGER NOT NULL DEFAULT {default_admin}")
 
         if default_admin:
@@ -166,6 +183,7 @@ async def init_db() -> None:
 async def prune_old_data(days: int = 14) -> None:
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("DELETE FROM recent_items WHERE updated_at < datetime('now', ?)", (f"-{int(days)} days",))
+        await db.execute("DELETE FROM drafts WHERE updated_at < datetime('now', ?)", (f"-{int(days)} days",))
         await db.commit()
 
 
@@ -389,14 +407,15 @@ async def log_sent_message(
     item_title: str,
     message_text: str,
     status: str = "sent",
+    info: str = "",
 ) -> None:
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             """
-            INSERT INTO sent_messages (user_id, item_id, seller_id, item_title, message_text, status)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO sent_messages (user_id, item_id, seller_id, item_title, message_text, status, info)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, str(item_id), str(seller_id) if seller_id else None, item_title, message_text, status),
+            (user_id, str(item_id), str(seller_id) if seller_id else None, item_title, message_text, status, (info or "")[:300]),
         )
         await db.commit()
 
@@ -412,14 +431,14 @@ async def get_recent_sent_messages(user_id: int, limit: int = 10) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-async def save_recent_item(item: dict, search_name: str) -> None:
+async def save_recent_item(item: dict, search_name: str, search_id: int | None = None) -> None:
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             """
             INSERT OR REPLACE INTO recent_items (
-                item_id, search_name, title, price, url, location, seller_type, description, discount_pct, seller_id
+                item_id, search_name, title, price, url, location, seller_type, description, discount_pct, seller_id, search_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(item["id"]),
@@ -432,9 +451,27 @@ async def save_recent_item(item: dict, search_name: str) -> None:
                 item.get("description", ""),
                 item.get("discount_pct", 0),
                 str(item["seller_id"]) if item.get("seller_id") else None,
+                search_id,
             ),
         )
         await db.commit()
+
+
+async def save_draft(user_id: int, item_id: str, text: str) -> None:
+    """Запоминает текст, который показан на карточке: кнопка «Отправить» шлёт именно его."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO drafts (user_id, item_id, text, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            (user_id, str(item_id), text),
+        )
+        await db.commit()
+
+
+async def get_draft(user_id: int, item_id: str) -> str | None:
+    async with aiosqlite.connect(DB_FILE) as db:
+        cur = await db.execute("SELECT text FROM drafts WHERE user_id = ? AND item_id = ?", (user_id, str(item_id)))
+        row = await cur.fetchone()
+        return row[0] if row else None
 
 
 async def get_recent_item(item_id: str) -> dict | None:

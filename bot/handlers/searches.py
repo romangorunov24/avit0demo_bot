@@ -2,13 +2,37 @@ import html
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
-from bot.keyboards import cancel_kb, city_kb, main_menu_kb, memory_kb, search_detail_kb, searches_list_kb, skip_or_cancel_kb
+from bot.keyboards import (
+    cancel_kb,
+    city_kb,
+    confirm_delete_kb,
+    main_menu_kb,
+    memory_kb,
+    search_detail_kb,
+    searches_list_kb,
+    skip_or_cancel_kb,
+)
 from bot.states import SearchStates
 from database import db
 from services.search_url import build_search_url, city_title, resolve_city, validate_avito_url
 from services.worker import process_single_search
 
 router = Router()
+
+MAX_NAME_LEN = 60
+MAX_TEMPLATE_LEN = 1000
+MAX_PRICE = 100_000_000
+
+
+def _parse_price(text: str | None) -> tuple[int | None, bool]:
+    """(значение, корректно). Пустой ввод = не задано (корректно); текст без цифр = некорректно."""
+    raw = (text or "").strip()
+    if not raw:
+        return None, True
+    digits = "".join(c for c in raw if c.isdigit())
+    if not digits:
+        return None, False
+    return min(int(digits), MAX_PRICE), True
 
 
 def _format_search_detail(s: dict) -> str:
@@ -185,7 +209,7 @@ async def pick_memory(callback: CallbackQuery, state: FSMContext) -> None:
 async def step_name(message: Message, state: FSMContext) -> None:
     if not message.text:
         return
-    await state.update_data(name=message.text.strip())
+    await state.update_data(name=message.text.strip()[:MAX_NAME_LEN])
     await state.set_state(SearchStates.waiting_url)
     await message.answer(
         "2️⃣ <b>Шаг 2 из 7 — Ссылка на выдачу Авито</b>\n\n"
@@ -227,8 +251,11 @@ async def skip_min(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(SearchStates.waiting_min_price)
 async def step_min(message: Message, state: FSMContext) -> None:
-    digits = "".join(c for c in (message.text or "") if c.isdigit())
-    await state.update_data(min_price=int(digits) if digits else None)
+    value, valid = _parse_price(message.text)
+    if not valid:
+        await message.answer("Введите сумму цифрами, например: <code>15000</code>, или нажмите «Пропустить».", parse_mode="HTML", reply_markup=skip_or_cancel_kb("skip_min_price"))
+        return
+    await state.update_data(min_price=value)
     await state.set_state(SearchStates.waiting_max_price)
     await message.answer(
         "4️⃣ <b>Шаг 4 из 7 — Максимальная цена (в рублях)</b>\n\n"
@@ -254,8 +281,18 @@ async def skip_max(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(SearchStates.waiting_max_price)
 async def step_max(message: Message, state: FSMContext) -> None:
-    digits = "".join(c for c in (message.text or "") if c.isdigit())
-    await state.update_data(max_price=int(digits) if digits else None)
+    value, valid = _parse_price(message.text)
+    if not valid:
+        await message.answer("Введите сумму цифрами, например: <code>55000</code>, или нажмите «Пропустить».", parse_mode="HTML", reply_markup=skip_or_cancel_kb("skip_max_price"))
+        return
+    min_price = (await state.get_data()).get("min_price")
+    if value and min_price and value < min_price:
+        await message.answer(
+            f"Максимальная цена не может быть меньше минимальной ({min_price} ₽). Введите другую сумму или нажмите «Пропустить».",
+            reply_markup=skip_or_cancel_kb("skip_max_price"),
+        )
+        return
+    await state.update_data(max_price=value)
     await state.set_state(SearchStates.waiting_sniper_price)
     await message.answer(
         "5️⃣ <b>Шаг 5 из 7 — Снайпер-цена (супер-выгода)</b>\n\n"
@@ -282,8 +319,11 @@ async def skip_sniper(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(SearchStates.waiting_sniper_price)
 async def step_sniper(message: Message, state: FSMContext) -> None:
-    digits = "".join(c for c in (message.text or "") if c.isdigit())
-    await state.update_data(sniper_price=int(digits) if digits else None)
+    value, valid = _parse_price(message.text)
+    if not valid:
+        await message.answer("Введите сумму цифрами или нажмите «Пропустить».", reply_markup=skip_or_cancel_kb("skip_sniper_price"))
+        return
+    await state.update_data(sniper_price=value)
     await state.set_state(SearchStates.waiting_plus_words)
     await message.answer(
         "6️⃣ <b>Шаг 6 из 7 — Обязательные плюс-слова</b>\n\n"
@@ -450,8 +490,10 @@ async def run_search_now(callback: CallbackQuery) -> None:
     found = await process_single_search(callback.bot, s, force_preview=True)
     if found == 0:
         await callback.message.answer(
-            "⚠️ Подходящих объявлений не найдено или нет связи с Avito.\n"
-            "Нажмите <b>«🤖 Автоотклик и Аккаунт» → «🌐 Проверить IP и связь с Avito»</b> для диагностики.",
+            "⚠️ Подходящих объявлений не найдено.\n"
+            "Возможные причины: фильтры (цена, память, слова) отсекли всю выдачу, по ссылке ничего нет или нет связи с Avito.\n"
+            "Для диагностики сети нажмите <b>«🤖 Автоотклик и Аккаунт» → «🌐 Проверить IP и связь с Avito»</b>, "
+            "подробности смотрите в консоли бота.",
             parse_mode="HTML",
         )
 
@@ -506,46 +548,74 @@ async def save_edited_search_param(message: Message, state: FSMContext) -> None:
     field = data.get("edit_field")
     txt = (message.text or "").strip()
 
-    if search_id and not await db.get_search_owned(search_id, message.from_user.id):
+    s = await db.get_search_owned(search_id, message.from_user.id) if search_id else None
+    if not s:
         await state.clear()
         await message.answer("Поиск не найден.", reply_markup=main_menu_kb())
         return
+    if not txt:
+        await message.answer("Пришлите значение текстом.", reply_markup=cancel_kb())
+        return
 
-    if search_id and field and txt:
-        if field == "price":
-            if txt == "0":
-                await db.update_search_field(search_id, "min_price", None)
-                await db.update_search_field(search_id, "max_price", None)
-            elif "-" in txt:
-                p1, p2 = txt.split("-", 1)
-                d1 = "".join(c for c in p1 if c.isdigit())
-                d2 = "".join(c for c in p2 if c.isdigit())
-                await db.update_search_field(search_id, "min_price", int(d1) if d1 else None)
-                await db.update_search_field(search_id, "max_price", int(d2) if d2 else None)
-            else:
-                d = "".join(c for c in txt if c.isdigit())
-                await db.update_search_field(search_id, "max_price", int(d) if d else None)
-        elif field == "sniper":
-            d = "".join(c for c in txt if c.isdigit())
-            val = int(d) if d and int(d) > 0 else None
-            await db.update_search_field(search_id, "sniper_price", val)
-        elif field == "plus":
-            await db.update_search_field(search_id, "plus_words", None if txt == "-" else txt)
-        elif field == "stop":
-            await db.update_search_field(search_id, "stop_words", None if txt == "-" else txt)
-        elif field == "tpl":
-            await db.update_search_field(search_id, "message_template", None if txt == "-" else txt)
-        elif field == "name":
-            await db.update_search_field(search_id, "name", txt)
+    if field == "price":
+        if txt == "0":
+            lo, hi = None, None
+        elif "-" in txt:
+            p1, p2 = txt.split("-", 1)
+            (lo, ok1), (hi, ok2) = _parse_price(p1), _parse_price(p2)
+            if not (ok1 and ok2) or (lo is None and hi is None):
+                await message.answer("Не понял диапазон. Пример: <code>15000-50000</code>", parse_mode="HTML", reply_markup=cancel_kb())
+                return
+        else:
+            lo, (hi, ok) = s.get("min_price"), _parse_price(txt)
+            if not ok or hi is None:
+                await message.answer("Введите число, диапазон <code>15000-50000</code> или <code>0</code> для сброса.", parse_mode="HTML", reply_markup=cancel_kb())
+                return
+        if lo and hi and lo > hi:
+            lo, hi = hi, lo  # перепутали порядок: меняем местами
+        await db.update_search_field(search_id, "min_price", lo)
+        await db.update_search_field(search_id, "max_price", hi)
+    elif field == "sniper":
+        value, valid = _parse_price(txt)
+        if not valid:
+            await message.answer("Введите сумму цифрами или <code>0</code>, чтобы отключить.", parse_mode="HTML", reply_markup=cancel_kb())
+            return
+        await db.update_search_field(search_id, "sniper_price", value if value and value > 0 else None)
+    elif field == "plus":
+        await db.update_search_field(search_id, "plus_words", None if txt == "-" else txt)
+    elif field == "stop":
+        await db.update_search_field(search_id, "stop_words", None if txt == "-" else txt)
+    elif field == "tpl":
+        if len(txt) > MAX_TEMPLATE_LEN:
+            await message.answer(f"Шаблон слишком длинный (максимум {MAX_TEMPLATE_LEN} символов).", reply_markup=cancel_kb())
+            return
+        await db.update_search_field(search_id, "message_template", None if txt == "-" else txt)
+    elif field == "name":
+        await db.update_search_field(search_id, "name", txt[:MAX_NAME_LEN])
 
     await state.clear()
     await message.answer("✅ Параметры поиска обновлены!", reply_markup=main_menu_kb())
 
 
 @router.callback_query(F.data.startswith("sdel_"))
+async def ask_delete_search(callback: CallbackQuery) -> None:
+    search_id = int(callback.data.split("_")[1])
+    s = await db.get_search_owned(search_id, callback.from_user.id)
+    if not s:
+        await callback.answer("Поиск не найден", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"🗑 Удалить поиск <b>«{html.escape(s['name'])}»</b>? Это действие нельзя отменить.",
+        parse_mode="HTML",
+        reply_markup=confirm_delete_kb(search_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("sdelok_"))
 async def del_search(callback: CallbackQuery) -> None:
     search_id = int(callback.data.split("_")[1])
-    await db.delete_search(search_id, callback.from_user.id)
+    deleted = await db.delete_search(search_id, callback.from_user.id)
     searches = await db.get_user_searches(callback.from_user.id)
-    await callback.message.edit_text("🗑 Поиск удалён.", reply_markup=searches_list_kb(searches))
+    await callback.message.edit_text("🗑 Поиск удалён." if deleted else "Поиск не найден.", reply_markup=searches_list_kb(searches))
     await callback.answer()

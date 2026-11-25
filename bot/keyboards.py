@@ -2,6 +2,20 @@ from typing import Any
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 
+# Тексты кнопок главного меню: нажатие любой из них сбрасывает незавершённый ввод (см. MenuResetMiddleware)
+MENU_TEXTS = frozenset(
+    {
+        "🧭 Поиск по параметрам",
+        "🔍 Мои поиски",
+        "➕ Добавить поиск",
+        "🤖 Автоотклик и Аккаунт",
+        "⚙️ Фильтры и Настройки",
+        "⭐ Избранное",
+        "📖 Инструкция и Защита",
+    }
+)
+
+
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -25,6 +39,15 @@ def skip_or_cancel_kb(skip_cb: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="⏭ Пропустить шаг", callback_data=skip_cb)],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_fsm")],
+        ]
+    )
+
+
+def confirm_delete_kb(search_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"sdelok_{search_id}")],
+            [InlineKeyboardButton(text="⬅️ Нет, назад", callback_data=f"sview_{search_id}")],
         ]
     )
 

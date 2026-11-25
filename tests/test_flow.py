@@ -9,7 +9,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, Chat, Message, Update, User
 
 from bot.handlers import actions, searches, settings as settings_handler, start
-from bot.middlewares import AccessMiddleware
+from bot.middlewares import AccessMiddleware, MenuResetMiddleware
 from database import db
 
 
@@ -48,6 +48,7 @@ class Harness:
         self.session = RecSession()
         self.bot = Bot("123456:TEST", session=self.session)
         self.dp = Dispatcher(storage=MemoryStorage())
+        self.dp.message.outer_middleware(MenuResetMiddleware())
         self.dp.message.middleware(AccessMiddleware())
         self.dp.callback_query.middleware(AccessMiddleware())
         for r in (start.router, searches.router, settings_handler.router, actions.router):
@@ -131,4 +132,27 @@ def test_disconnect_account_no_longer_crashes(h):
         await h.tap(1, "acc_disconnect")
         u = await db.get_user_settings(1)
         assert u["avito_cookies"] is None and u["auto_reply_enabled"] == 0
+    asyncio.run(go())
+
+
+def test_menu_button_in_the_middle_of_wizard_is_not_taken_as_answer(h):
+    async def go():
+        await h.say(1, "➕ Добавить поиск")  # мастер ждёт название
+        before = len(h.session.calls)
+        await h.say(1, "🤖 Автоотклик и Аккаунт")  # нажали кнопку меню вместо названия
+        shown = [t or "" for t in h.session.texts()[before:]]
+        assert any("Управление Автооткликом" in t for t in shown)
+        before = len(h.session.calls)
+        await h.say(1, "обычный текст")  # мастер сброшен: это уже не название поиска
+        assert not any("Шаг 2 из 7" in (t or "") for t in h.session.texts()[before:])
+    asyncio.run(go())
+
+
+def test_delete_search_asks_for_confirmation(h):
+    async def go():
+        sid = await db.add_search(user_id=1, name="на удаление", url="https://www.avito.ru/moskva/telefony?q=x")
+        await h.tap(1, f"sdel_{sid}")
+        assert await db.get_search_by_id(sid) is not None  # первое нажатие только спрашивает
+        await h.tap(1, f"sdelok_{sid}")
+        assert await db.get_search_by_id(sid) is None
     asyncio.run(go())
