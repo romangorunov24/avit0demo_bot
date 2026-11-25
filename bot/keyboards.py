@@ -140,7 +140,8 @@ def item_card_kb(item_url: str, item_id: int | str, seller_id: str | None = None
         ]
     )
     bottom = [InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav_add:{item_id}")]
-    if seller_id:
+    # callback_data у Telegram не длиннее 64 байт: иначе вся клавиатура отклоняется и карточка не доходит
+    if seller_id and len(f"ban:{seller_id}".encode("utf-8")) <= 64:
         bottom.append(InlineKeyboardButton(text="🚫 Продавца в ЧС", callback_data=f"ban:{seller_id}"))
     rows.append(bottom)
     return InlineKeyboardMarkup(inline_keyboard=rows)

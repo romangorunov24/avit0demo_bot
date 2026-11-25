@@ -13,15 +13,26 @@ from bot.keyboards import (
     skip_or_cancel_kb,
 )
 from bot.states import SearchStates
+from config import settings
 from database import db
 from services.search_url import build_search_url, city_title, resolve_city, validate_avito_url
 from services.worker import process_single_search
 
 router = Router()
 
+MAX_SEARCHES_PER_USER = 15  # у администратора без ограничения
 MAX_NAME_LEN = 60
 MAX_TEMPLATE_LEN = 1000
 MAX_PRICE = 100_000_000
+
+
+async def _searches_limit_reached(user_id: int) -> bool:
+    if user_id in settings.admin_ids_list:
+        return False
+    return len(await db.get_user_searches(user_id)) >= MAX_SEARCHES_PER_USER
+
+
+LIMIT_TEXT = f"Достигнут лимит: не больше {MAX_SEARCHES_PER_USER} поисков на пользователя. Удалите ненужный поиск в «🔍 Мои поиски»."
 
 
 def _parse_price(text: str | None) -> tuple[int | None, bool]:
@@ -91,6 +102,9 @@ async def back_to_searches(callback: CallbackQuery) -> None:
 @router.message(F.text == "➕ Добавить поиск")
 async def start_add_search(message: Message, state: FSMContext) -> None:
     await state.clear()
+    if await _searches_limit_reached(message.from_user.id):
+        await message.answer(LIMIT_TEXT)
+        return
     await state.set_state(SearchStates.waiting_name)
     await message.answer(
         "1️⃣ <b>Шаг 1 из 7 — Название поиска</b>\n\n"
@@ -103,6 +117,9 @@ async def start_add_search(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "add_search")
 async def cb_add_search(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
+    if await _searches_limit_reached(callback.from_user.id):
+        await callback.answer(LIMIT_TEXT, show_alert=True)
+        return
     await state.set_state(SearchStates.waiting_name)
     await callback.message.answer(
         "1️⃣ <b>Шаг 1 из 7 — Название поиска</b>\n\n"
@@ -122,6 +139,9 @@ PARAM_INTRO = (
 @router.message(F.text == "🧭 Поиск по параметрам")
 async def start_param_search(message: Message, state: FSMContext) -> None:
     await state.clear()
+    if await _searches_limit_reached(message.from_user.id):
+        await message.answer(LIMIT_TEXT)
+        return
     await state.set_state(SearchStates.waiting_city)
     await message.answer(PARAM_INTRO, parse_mode="HTML", reply_markup=city_kb())
 
@@ -364,6 +384,10 @@ async def step_plus(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "skip_stop_words", SearchStates.waiting_stop_words)
 async def finish_skip_stop(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
+    if await _searches_limit_reached(callback.from_user.id):
+        await state.clear()
+        await callback.answer(LIMIT_TEXT, show_alert=True)
+        return
     await db.add_search(
         user_id=callback.from_user.id,
         name=data["name"],
@@ -390,6 +414,10 @@ async def finish_skip_stop(callback: CallbackQuery, state: FSMContext) -> None:
 @router.message(SearchStates.waiting_stop_words)
 async def finish_with_stop(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
+    if await _searches_limit_reached(message.from_user.id):
+        await state.clear()
+        await message.answer(LIMIT_TEXT, reply_markup=main_menu_kb())
+        return
     await db.add_search(
         user_id=message.from_user.id,
         name=data["name"],

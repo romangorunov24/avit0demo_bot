@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher
+from aiogram.types import ErrorEvent
 from aiogram.fsm.storage.memory import MemoryStorage
 from bot.handlers import actions, searches, settings as settings_handler, start
 from bot.middlewares import AccessMiddleware, MenuResetMiddleware
@@ -29,6 +30,19 @@ async def main() -> None:
     dp.message.outer_middleware(MenuResetMiddleware())
     dp.message.middleware(AccessMiddleware())
     dp.callback_query.middleware(AccessMiddleware())
+
+    async def on_error(event: ErrorEvent) -> bool:
+        """Любая необработанная ошибка: пишем в лог и не оставляем у пользователя «крутящуюся» кнопку."""
+        logger.error("Необработанная ошибка в обработчике: %r", event.exception, exc_info=event.exception)
+        try:
+            cq = event.update.callback_query
+            if cq:
+                await cq.answer("Что-то пошло не так, попробуйте ещё раз", show_alert=True)
+        except Exception:
+            pass
+        return True
+
+    dp.errors.register(on_error)
 
     dp.include_router(start.router)
     dp.include_router(searches.router)

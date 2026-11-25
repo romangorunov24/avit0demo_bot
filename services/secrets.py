@@ -1,4 +1,5 @@
 """Шифрование cookies Авито в базе (Fernet). Ключ берётся из COOKIES_KEY или создаётся в data/cookies.key."""
+import logging
 import os
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -45,4 +46,8 @@ def decrypt(value: str | None) -> str | None:
     try:
         return _get().decrypt(value[len(PREFIX):].encode("utf-8")).decode("utf-8")
     except InvalidToken:
+        logging.getLogger(__name__).error(
+            "Не удалось расшифровать cookies: ключ шифрования изменился или потерян (COOKIES_KEY / data/cookies.key). "
+            "Подключите аккаунт Avito заново и задайте постоянный COOKIES_KEY."
+        )
         return None

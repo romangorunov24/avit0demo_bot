@@ -20,6 +20,20 @@ MAX_SEND_ATTEMPTS = 3            # попыток отправки одного 
 RATE_LIMIT_PAUSE_SEC = 30 * 60   # пауза автоотклика после ответа Авито 429
 PHOTO_CAPTION_LIMIT = 1024       # лимит Telegram на подпись к фото
 _AUTO_PAUSE_UNTIL: dict[int, float] = {}
+MAX_DELIVERY_FAILS = 3           # столько раз пробуем доставить карточку, потом лот пропускаем (иначе вечный повтор)
+_DELIVERY_FAILS: dict[tuple[int, str], int] = {}
+_SEND_LOCKS: dict[int, asyncio.Lock] = {}
+IN_FLIGHT: set[tuple[int, str]] = set()  # отправки, идущие прямо сейчас (общий для автоотклика и кнопки)
+
+
+def send_lock(user_id: int) -> asyncio.Lock:
+    """Отправки одного пользователя идут строго по очереди: проверка лимитов и сама отправка не гоняются друг с другом."""
+    return _SEND_LOCKS.setdefault(user_id, asyncio.Lock())
+
+
+async def user_is_active(user_id: int) -> bool:
+    """Администратор или пользователь с выданным доступом. У отозванных поиски не обрабатываются."""
+    return user_id in settings.admin_ids_list or await db.is_user_allowed(user_id)
 
 
 def build_item_caption(
@@ -165,7 +179,8 @@ async def send_item_card(
         and bool(search.get("auto_reply", 1))
     )
     if should_auto:
-        sent_auto, auto_reply_note = await _try_auto_reply(user_id, item, ready_msg, user_settings)
+        async with send_lock(user_id):
+            sent_auto, auto_reply_note = await _try_auto_reply(user_id, item, ready_msg, user_settings)
 
     await db.save_recent_item(item, search["name"], search.get("id"))
     await db.save_draft(user_id, item_id, ready_msg)
@@ -253,6 +268,9 @@ async def process_single_search(bot: Bot, search: dict, force_preview: bool = Fa
     title = search["name"]
     url = search["url"]
 
+    if not force_preview and not await user_is_active(user_id):
+        return 0  # доступ отозван: ни мониторинга, ни автоотклика с cookies этого пользователя
+
     user_settings = await db.get_user_settings(user_id)
     if user_settings.get("is_paused") and not force_preview:
         return 0
@@ -292,10 +310,17 @@ async def process_single_search(bot: Bot, search: dict, force_preview: bool = Fa
                 allow_auto_reply=(not force_preview),
             )
         except Exception as e:
-            # Лот НЕ помечаем просмотренным: попробуем снова в следующем цикле.
+            # Лот пока НЕ помечаем просмотренным: попробуем снова в следующем цикле.
             # Повторное сообщение продавцу исключено проверкой was_item_messaged.
-            logger.error("Не удалось доставить карточку '%s' пользователю %s: %s", item_id, user_id, e)
+            key = (search_id, item_id)
+            _DELIVERY_FAILS[key] = _DELIVERY_FAILS.get(key, 0) + 1
+            logger.error("Не удалось доставить карточку '%s' пользователю %s (%d/%d): %s", item_id, user_id, _DELIVERY_FAILS[key], MAX_DELIVERY_FAILS, e)
+            if _DELIVERY_FAILS[key] >= MAX_DELIVERY_FAILS and not force_preview:
+                # Постоянная причина (бот заблокирован, неверная разметка): не повторяем бесконечно
+                await db.mark_item_seen(search_id, item_id)
+                _DELIVERY_FAILS.pop(key, None)
             continue
+        _DELIVERY_FAILS.pop((search_id, item_id), None)
 
         # Тестовая проверка ничего не помечает, чтобы не «съедать» лоты у реального мониторинга
         if not force_preview:

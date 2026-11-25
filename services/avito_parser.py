@@ -7,7 +7,7 @@ import time
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
-from services.proxy_helper import get_proxy_candidates
+from services.proxy_helper import get_proxy_candidates, is_proxy_error, redact
 from services.search_url import validate_avito_url
 
 logger = logging.getLogger(__name__)
@@ -151,9 +151,9 @@ async def parse_avito_search(search_url: str, search_name: str = "", ignore_back
                 html = resp.text
                 break
         except Exception as e:
-            err_s = str(e)
+            err_s = redact(e)
             _GUEST_COOKIES.clear()
-            if "Proxy CONNECT aborted" in err_s:
+            if is_proxy_error(err_s):
                 continue
             logger.error("Ошибка соединения при парсинге '%s': %s", search_name or url, err_s)
             return []
@@ -193,7 +193,9 @@ async def parse_avito_search(search_url: str, search_name: str = "", ignore_back
         elif href.startswith("http"):
             item_url = href
         else:
-            item_url = f"https://www.avito.ru/items/{item_id}"
+            item_url = ""
+        # Ссылка лота обязана вести на avito.ru: с ней потом работают кнопка и отправка с cookies
+        item_url = validate_avito_url(item_url) or f"https://www.avito.ru/items/{item_id}"
 
         price_val: int | None = None
         price_meta = card.select_one('meta[itemprop="price"]')

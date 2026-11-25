@@ -151,6 +151,7 @@ def setup_search(monkeypatch, items, **kw):
 
     async def prep():
         await db.init_db()
+        await db.grant_user_access(500)
         sid = await db.add_search(user_id=500, name="t", url="https://www.avito.ru/moskva/telefony?q=iphone", **kw)
         await db.update_search_field(sid, "is_initialized", 1)
         return await db.get_search_by_id(sid)

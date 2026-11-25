@@ -331,6 +331,7 @@ def prepare(monkeypatch, items, *, user_auto=True, cookies=True, search_auto=1, 
 
     async def prep():
         await db.init_db()
+        await db.grant_user_access(uid)
         if cookies:
             await db.update_user_field(uid, "avito_cookies", COOKIES)
         await db.update_user_field(uid, "auto_reply_enabled", 1 if user_auto else 0)
@@ -574,3 +575,104 @@ def test_menu_button_resets_unfinished_input():
 def test_menu_texts_match_keyboard():
     buttons = {b.text for row in main_menu_kb().keyboard for b in row}
     assert buttons == set(MENU_TEXTS)
+
+
+def test_proxy_connect_error_tries_fallback_proxy(monkeypatch):
+    from services import proxy_helper
+    err = "Failed to perform, curl: (7) Failed to connect to www.avito.ru:443 over proxy mproxy.site after 132 ms"
+    assert proxy_helper.is_proxy_error(err) and not proxy_helper.is_proxy_error("HTTP 404")
+    tried = []
+
+    class Session:
+        def __init__(self, proxies=None, **kw):
+            self.cookies = {}
+            self.proxies = proxies
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            tried.append(self.proxies["http"].split("://")[0])
+            if self.proxies["http"].startswith("http://"):
+                raise RuntimeError(err)
+            return FakeResp(200, text=f"<html><body>{CARD}</body></html>")
+
+    monkeypatch.setattr(parser, "AsyncSession", Session)
+    monkeypatch.setattr(parser.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(parser, "get_proxy_candidates", lambda: proxy_helper.get_proxy_candidates("user:pw@mproxy.site:8000"))
+    parser._GUEST_COOKIES.clear()
+    parser._BACKOFF_UNTIL = 0.0
+    items = run(parser.parse_avito_search("https://www.avito.ru/moskva/telefony?q=iphone", "t"))
+    assert len(items) == 1 and "socks5h" in tried
+
+
+# ---------------------------------------------------------------- безопасность
+def test_proxy_formats_and_special_characters():
+    from services.proxy_helper import get_proxy_candidates, redact
+
+    c = get_proxy_candidates("proxy.example:8000:user:pa:ss@w#rd")  # пароль с «:», «@» и «#»
+    assert c[0]["http"] == "http://user:pa%3Ass%40w%23rd@proxy.example:8000"
+    assert c[1]["http"].startswith("socks5h://")  # запасной вариант
+    assert get_proxy_candidates("socks5://u:p@h:1080")[0]["http"] == "socks5h://u:p@h:1080"
+    assert get_proxy_candidates("h:3128")[0]["http"] == "http://h:3128"
+    assert get_proxy_candidates("") == [None]
+    assert "secret" not in redact("curl failed via http://user:secret@mproxy.site:8000 timeout")
+    assert "mproxy.site" in redact("http://user:secret@mproxy.site:8000")
+
+
+def test_long_seller_id_does_not_break_card_keyboard():
+    from bot.keyboards import item_card_kb
+
+    def has_ban(kb):
+        return any(b.callback_data.startswith("ban:") for row in kb.inline_keyboard for b in row if getattr(b, "callback_data", None))
+
+    assert has_ban(item_card_kb("https://www.avito.ru/items/1", "1", "short"))
+    long_kb = item_card_kb("https://www.avito.ru/items/1", "1", "очень-длинное-имя-магазина-" * 4)
+    assert not has_ban(long_kb)  # иначе Telegram отклонил бы всю клавиатуру
+    for row in long_kb.inline_keyboard:
+        for b in row:
+            assert len((getattr(b, "callback_data", None) or "").encode()) <= 64
+
+
+def test_revoked_user_is_not_processed(monkeypatch):
+    uid, s = prepare(monkeypatch, [lot(101)])
+    run(db.revoke_user_access(uid))
+    bot = FakeBot()
+    assert run(worker.process_single_search(bot, s)) == 0
+    assert FakeMessenger.calls == [] and bot.sent == []  # ни карточек, ни сообщений продавцам
+    assert run(db.is_item_seen(s["id"], "101")) is False
+
+
+def test_permanently_failing_delivery_is_given_up(monkeypatch):
+    uid, s = prepare(monkeypatch, [lot(111)], user_auto=False)
+    bot = FakeBot(fail=True)
+    for _ in range(worker.MAX_DELIVERY_FAILS):
+        run(worker.process_single_search(bot, s))
+    assert run(db.is_item_seen(s["id"], "111")) is True  # лот пропущен, цикл не крутится вечно
+
+
+def test_parser_replaces_foreign_item_link(monkeypatch):
+    card = CARD.replace('href="/moskva/telefony/iphone_13_111"', 'href="https://evil.example/redirect?x=1"')
+    install_search_page(monkeypatch, f"<html><body>{card}</body></html>")
+    items = run(parser.parse_avito_search("https://www.avito.ru/moskva/telefony?q=iphone", "t"))
+    assert items[0]["url"] == "https://www.avito.ru/items/111"
+
+
+def test_manual_and_auto_sends_share_one_queue(monkeypatch):
+    # одновременные отправки одного пользователя идут по очереди и не превышают лимит
+    uid, s = prepare(monkeypatch, [], max_replies_hour=1)
+    order = []
+
+    async def go():
+        async def one(tag):
+            async with worker.send_lock(uid):
+                order.append(f"start{tag}")
+                await asyncio.sleep(0)
+                order.append(f"end{tag}")
+        await asyncio.gather(one(1), one(2))
+
+    run(go())
+    assert order in (["start1", "end1", "start2", "end2"], ["start2", "end2", "start1", "end1"])

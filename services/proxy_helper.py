@@ -1,5 +1,22 @@
+import html
+import re
+from urllib.parse import quote
+
 from curl_cffi.requests import AsyncSession
 from config import settings
+
+_CRED_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s]+@")
+
+
+def redact(text: object) -> str:
+    """Прячет логин и пароль прокси (scheme://user:pass@host) в тексте ошибок и логов."""
+    return _CRED_RE.sub(r"\1***@", str(text))
+
+
+def is_proxy_error(err: object) -> bool:
+    """Ошибка именно соединения через прокси: стоит попробовать запасной тип прокси (HTTP <-> SOCKS5H)."""
+    low = str(err).lower()
+    return "proxy" in low or "(7)" in low or "(5)" in low or "(97)" in low or "(35)" in low
 
 
 def get_proxy_candidates(raw_proxy: str | None = None) -> list[dict[str, str] | None]:
@@ -23,13 +40,14 @@ def get_proxy_candidates(raw_proxy: str | None = None) -> list[dict[str, str] | 
         scheme = scheme.lower()
 
     normalized = body
-    if "@" not in body:
-        parts = body.split(":")
-        if len(parts) == 4:
+    # Формат host:port:user:password распознаём по началу «хост:порт:», даже если в пароле есть «@»
+    if "@" not in body or re.match(r"^[^:@/\s]+:\d{1,5}:", body):
+        # host:port:user:password. Пароль может сам содержать «:», поэтому делим максимум на 4 части.
+        # Логин и пароль кодируем: спецсимволы (@ # / %) иначе ломают адрес прокси.
+        parts = body.split(":", 3)
+        if len(parts) == 4 and parts[1].isdigit():
             host, port, user, password = parts
-            normalized = f"{user}:{password}@{host}:{port}"
-        elif len(parts) == 2:
-            normalized = body
+            normalized = f"{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}"
 
     if scheme in ("socks5", "socks5h"):
         return [
@@ -77,13 +95,13 @@ async def diagnose_connection() -> str:
                 return (
                     f"🌐 <b>Диагностика сети</b>\n\n"
                     f"• Режим: <b>{proto}</b>\n"
-                    f"• Текущий IP: <code>{ip_info}</code> ({country})\n"
-                    f"• Провайдер: {isp or 'не определён'}\n"
+                    f"• Текущий IP: <code>{html.escape(str(ip_info))}</code> ({html.escape(str(country))})\n"
+                    f"• Провайдер: {html.escape(str(isp)) or 'не определён'}\n"
                     f"• Гео-статус: {geo_note}\n"
                     f"• Доступ к Avito: {avito_note}"
                 )
         except Exception as e:
-            last_err = f"{proto}: {e}"
+            last_err = f"{proto}: {redact(e)}"
 
     hint = (
         "Проверьте баланс трафика и порт в личном кабинете прокси, либо запустите бота локально на ПК в РФ с пустым PROXY_URL."
@@ -92,6 +110,6 @@ async def diagnose_connection() -> str:
     )
     return (
         f"❌ <b>Ошибка сетевого соединения</b>\n\n"
-        f"Детали: <code>{last_err[:220]}</code>\n\n"
+        f"Детали: <code>{html.escape(last_err[:220])}</code>\n\n"
         f"💡 {hint}"
     )

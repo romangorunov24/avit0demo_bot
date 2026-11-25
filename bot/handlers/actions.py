@@ -6,13 +6,18 @@ from bot.keyboards import item_card_kb
 from database import db
 from services.avito_messenger import AvitoMessenger, normalize_cookies
 from services.spintax import render_spintax
-from services.worker import DEFAULT_TEMPLATE, PHOTO_CAPTION_LIMIT, build_item_caption, check_send_allowed
+from services.worker import (
+    DEFAULT_TEMPLATE,
+    IN_FLIGHT,
+    PHOTO_CAPTION_LIMIT,
+    build_item_caption,
+    check_send_allowed,
+    send_lock,
+)
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-# Защита от двойного нажатия «Отправить»: (user_id, item_id), пока идёт отправка
-_IN_FLIGHT: set[tuple[int, str]] = set()
 
 BARGAIN_DEFAULT = "{Здравствуйте|Добрый день}! За {price_bargain} ₽ отдадите, если подъеду сегодня?"
 DELIVERY_DEFAULT = "{Здравствуйте|Добрый день}! Авито Доставкой сможете отправить?"
@@ -78,44 +83,48 @@ async def send_message_now_cb(callback: CallbackQuery) -> None:
         return
 
     key = (user_id, item_id)
-    if key in _IN_FLIGHT:
+    if key in IN_FLIGHT:
         await callback.answer("Уже отправляю, подождите…")
         return
 
     seller_id = item.get("seller_id")
-    reason = await check_send_allowed(user_id, item_id, seller_id, u)
-    if reason:
-        await callback.answer(f"Не отправлено: {reason}", show_alert=True)
-        return
-
-    _IN_FLIGHT.add(key)
+    IN_FLIGHT.add(key)
     try:
         await callback.answer("⏳ Отправляю сообщение в Avito...")
-        # Отправляем ровно тот текст, который сейчас показан на карточке
-        ready_msg = await db.get_draft(user_id, item_id)
-        if not ready_msg:
-            raw_tpl = u.get("default_template") or DEFAULT_TEMPLATE
-            ready_msg = render_spintax(raw_tpl, title=item.get("title", ""), price=item.get("price"))
+        # Очередь отправок пользователя общая с автооткликом: лимиты и «уже писали» проверяются под замком
+        async with send_lock(user_id):
+            u = await db.get_user_settings(user_id)
+            cookies_raw = u.get("avito_cookies")
+            reason = await check_send_allowed(user_id, item_id, seller_id, u)
+            if reason:
+                await callback.message.answer(f"⚠️ Не отправлено: {reason}")
+                return
 
-        outcome = await AvitoMessenger().send_message_ex(
-            item_id=item_id,
-            item_url=item["url"],
-            text=ready_msg,
-            cookies_json=cookies_raw,
-        )
-        await db.log_sent_message(
-            user_id=user_id,
-            item_id=item_id,
-            seller_id=seller_id,
-            item_title=item.get("title") or "",
-            message_text=ready_msg,
-            status="sent" if outcome.ok else "failed",
-            info=outcome.info,
-        )
-        if outcome.security_alert:
-            await db.update_user_field(user_id, "auto_reply_enabled", 0)
+            # Отправляем ровно тот текст, который сейчас показан на карточке
+            ready_msg = await db.get_draft(user_id, item_id)
+            if not ready_msg:
+                raw_tpl = u.get("default_template") or DEFAULT_TEMPLATE
+                ready_msg = render_spintax(raw_tpl, title=item.get("title", ""), price=item.get("price"))
+
+            outcome = await AvitoMessenger().send_message_ex(
+                item_id=item_id,
+                item_url=item["url"],
+                text=ready_msg,
+                cookies_json=cookies_raw,
+            )
+            await db.log_sent_message(
+                user_id=user_id,
+                item_id=item_id,
+                seller_id=seller_id,
+                item_title=item.get("title") or "",
+                message_text=ready_msg,
+                status="sent" if outcome.ok else "failed",
+                info=outcome.info,
+            )
+            if outcome.security_alert:
+                await db.update_user_field(user_id, "auto_reply_enabled", 0)
     finally:
-        _IN_FLIGHT.discard(key)
+        IN_FLIGHT.discard(key)
 
     if outcome.ok:
         await callback.message.answer("✅ Сообщение отправлено продавцу!")

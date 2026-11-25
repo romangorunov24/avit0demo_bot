@@ -16,7 +16,7 @@ from typing import Any
 
 from curl_cffi.requests import AsyncSession
 
-from services.proxy_helper import get_proxy_candidates
+from services.proxy_helper import get_proxy_candidates, is_proxy_error, redact
 from services.search_url import validate_avito_url
 
 logger = logging.getLogger(__name__)
@@ -249,8 +249,8 @@ class AvitoMessenger:
                         return False, f"Авито не принял сессию (HTTP {page.status_code}). Обновите cookies."
                     return False, f"Не удалось подтвердить сессию (HTTP {status}/{page.status_code}). Cookies сохранены, проверьте отправкой."
             except Exception as e:
-                last_err = str(e)
-                if "Proxy CONNECT aborted" in last_err:
+                last_err = redact(e)
+                if is_proxy_error(last_err):
                     continue
                 break
 
@@ -310,9 +310,9 @@ class AvitoMessenger:
                         )
                         page_status = page.status_code
                     except Exception as e:
-                        if "Proxy CONNECT aborted" in str(e):
+                        if is_proxy_error(e):
                             raise
-                        logger.info("Avito send %s: страница объявления не открылась (%s)", numeric_item_id, str(e)[:100])
+                        logger.info("Avito send %s: страница объявления не открылась (%s)", numeric_item_id, redact(e)[:100])
 
                     if page_status in (404, 410):
                         return SendOutcome(False, "Объявление уже снято (страница недоступна).")
@@ -401,8 +401,8 @@ class AvitoMessenger:
 
                     return SendOutcome(False, f"Чат открыт, но текст не принят (HTTP {last_status or 'ERR'}).")
             except Exception as e:
-                last_err = str(e)
-                if "Proxy CONNECT aborted" in last_err:
+                last_err = redact(e)
+                if is_proxy_error(last_err):
                     continue
                 logger.warning("Avito send %s: ошибка сети: %s", numeric_item_id, last_err[:200])
                 # Повтор безопасен, только если текст ещё не отправлялся
