@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import random
 import re
 import statistics
@@ -7,13 +8,25 @@ import time
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
+from services.avito_messenger import parse_cookies
 from services.proxy_helper import get_proxy_candidates, is_proxy_error, redact
 from services.search_url import validate_avito_url
 
 logger = logging.getLogger(__name__)
 
-_GUEST_COOKIES: dict[str, str] = {}
+
+def _load_seed_cookies() -> dict[str, str]:
+    """Загружает стартовые гостевые антибот-cookies из переменной окружения AVITO_GUEST_COOKIES."""
+    return parse_cookies(os.getenv("AVITO_GUEST_COOKIES") or "")
+
+
+_GUEST_COOKIES: dict[str, str] = _load_seed_cookies()
 _BACKOFF_UNTIL: float = 0.0
+
+
+def _reset_guest_cookies() -> None:
+    _GUEST_COOKIES.clear()
+    _GUEST_COOKIES.update(_load_seed_cookies())
 
 
 def _ensure_sorted_by_date(url: str) -> str:
@@ -102,7 +115,6 @@ async def parse_avito_search(search_url: str, search_name: str = "", ignore_back
         return []
     url = _ensure_sorted_by_date(checked)
 
-    # Оставляем только Accept-Language, чтобы curl_cffi сам формировал нативные заголовки Chrome
     base_headers = {
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     }
@@ -119,7 +131,6 @@ async def parse_avito_search(search_url: str, search_name: str = "", ignore_back
                         warm_ok = True
                         await asyncio.sleep(random.uniform(1.5, 3.0))
                     else:
-                        # Если главная вернула 403/429, не обрываем сразу — пробуем открыть сам поиск после паузы
                         logger.info(
                             "Главная Avito при прогреве вернула %s, пробуем прямой переход в поиск...",
                             warm_resp.status_code,
@@ -132,8 +143,8 @@ async def parse_avito_search(search_url: str, search_name: str = "", ignore_back
 
                 resp = await session.get(url, headers=search_headers, cookies=_GUEST_COOKIES)
 
-                if resp.status_code in (403, 429):
-                    _GUEST_COOKIES.clear()
+                if resp.status_code in (403, 429, 439):
+                    _reset_guest_cookies()
                     _BACKOFF_UNTIL = time.time() + 180
                     logger.warning(
                         "Avito вернул статус %s для '%s' (защитная пауза 3 мин.)",
@@ -156,7 +167,7 @@ async def parse_avito_search(search_url: str, search_name: str = "", ignore_back
                 break
         except Exception as e:
             err_s = redact(e)
-            _GUEST_COOKIES.clear()
+            _reset_guest_cookies()
             if is_proxy_error(err_s):
                 continue
             logger.error("Ошибка соединения при парсинге '%s': %s", search_name or url, err_s)
@@ -172,7 +183,7 @@ async def parse_avito_search(search_url: str, search_name: str = "", ignore_back
     if not cards:
         if _looks_blocked(html):
             _BACKOFF_UNTIL = time.time() + 180
-            _GUEST_COOKIES.clear()
+            _reset_guest_cookies()
             logger.warning(
                 "Avito показал страницу защиты/капчу для '%s' (пауза парсера 3 мин.). Проверьте IP/прокси.",
                 search_name or url,
