@@ -42,8 +42,6 @@ def get_proxy_candidates(raw_proxy: str | None = None) -> list[dict[str, str] | 
     normalized = body
     # Формат host:port:user:password распознаём по началу «хост:порт:», даже если в пароле есть «@»
     if "@" not in body or re.match(r"^[^:@/\s]+:\d{1,5}:", body):
-        # host:port:user:password. Пароль может сам содержать «:», поэтому делим максимум на 4 части.
-        # Логин и пароль кодируем: спецсимволы (@ # / %) иначе ломают адрес прокси.
         parts = body.split(":", 3)
         if len(parts) == 4 and parts[1].isdigit():
             host, port, user, password = parts
@@ -67,6 +65,14 @@ def get_proxy_candidates(raw_proxy: str | None = None) -> list[dict[str, str] | 
     ]
 
 
+def create_browser_session(proxies: dict[str, str] | None, timeout: int = 20) -> AsyncSession:
+    """Создаёт сессию с актуальным TLS-отпечатком Chrome."""
+    try:
+        return AsyncSession(impersonate="chrome", proxies=proxies, timeout=timeout)
+    except Exception:
+        return AsyncSession(impersonate="chrome124", proxies=proxies, timeout=timeout)
+
+
 async def diagnose_connection() -> str:
     candidates = get_proxy_candidates()
     using_proxy = candidates[0] is not None
@@ -75,31 +81,36 @@ async def diagnose_connection() -> str:
     for proxies in candidates:
         proto = "Прямое подключение (без прокси)" if not proxies else proxies["http"].split("://")[0].upper()
         try:
-            async with AsyncSession(impersonate="chrome124", proxies=proxies, timeout=15) as session:
-                ip_resp = await session.get("https://ipwho.is/")
-                ip_info = "неизвестен"
-                country = "?"
-                isp = ""
+            ip_info = "неизвестен"
+            country = "?"
+            isp = ""
+
+            async with create_browser_session(proxies, timeout=15) as ip_session:
+                ip_resp = await ip_session.get("https://ipwho.is/")
                 if ip_resp.status_code == 200:
                     j = ip_resp.json()
                     ip_info = j.get("ip") or ip_info
                     country = j.get("country_code") or "?"
                     isp = j.get("connection", {}).get("isp") or ""
 
-                avito_resp = await session.get("https://www.avito.ru/")
+            async with create_browser_session(proxies, timeout=20) as avito_session:
+                avito_resp = await avito_session.get(
+                    "https://www.avito.ru/",
+                    headers={"Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"},
+                )
                 st = avito_resp.status_code
 
-                geo_note = "✅ Отлично (IP из России)" if country == "RU" else "⚠️ Внимание: IP не из России (возможен блок Авито)"
-                avito_note = "✅ Avito доступен (HTTP 200)" if st == 200 else f"❌ Avito вернул HTTP {st}"
+            geo_note = "✅ Отлично (IP из России)" if country == "RU" else "⚠️ Внимание: IP не из России (возможен блок Авито)"
+            avito_note = "✅ Avito доступен (HTTP 200)" if st == 200 else f"❌ Avito вернул HTTP {st}"
 
-                return (
-                    f"🌐 <b>Диагностика сети</b>\n\n"
-                    f"• Режим: <b>{proto}</b>\n"
-                    f"• Текущий IP: <code>{html.escape(str(ip_info))}</code> ({html.escape(str(country))})\n"
-                    f"• Провайдер: {html.escape(str(isp)) or 'не определён'}\n"
-                    f"• Гео-статус: {geo_note}\n"
-                    f"• Доступ к Avito: {avito_note}"
-                )
+            return (
+                f"🌐 <b>Диагностика сети</b>\n\n"
+                f"• Режим: <b>{proto}</b>\n"
+                f"• Текущий IP: <code>{html.escape(str(ip_info))}</code> ({html.escape(str(country))})\n"
+                f"• Провайдер: {html.escape(str(isp)) or 'не определён'}\n"
+                f"• Гео-статус: {geo_note}\n"
+                f"• Доступ к Avito: {avito_note}"
+            )
         except Exception as e:
             last_err = f"{proto}: {redact(e)}"
 
