@@ -14,9 +14,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from curl_cffi.requests import AsyncSession
-
-from services.proxy_helper import get_proxy_candidates, is_proxy_error, redact
+from services.proxy_helper import create_browser_session, get_proxy_candidates, is_proxy_error, redact
 from services.search_url import validate_avito_url
 
 logger = logging.getLogger(__name__)
@@ -28,7 +26,7 @@ DISPLAY_KEYS = ("sessid", "u", "v", "auth", "srv_id", "ft", "f", "sx", "buyer_lo
 MAX_COOKIES = 150
 MAX_COOKIE_VALUE = 4096
 
-# Шаг 1: создать чат по объявлению. Третье поле: что вернёт адрес ("channel" = id чата).
+# Шаг 1: создать чат по объявлению.
 CHANNEL_ENDPOINTS = (
     "https://www.avito.ru/web/1/messenger/createChannelByItemId",
     "https://www.avito.ru/web/2/messenger/createChannelByItemId",
@@ -70,7 +68,6 @@ def parse_cookies(raw: Any) -> dict[str, str]:
             except json.JSONDecodeError:
                 pass
 
-        # JSON, который Telegram порезал на части или вставили не целиком: достаём объекты по одному
         for block in re.findall(r"\{[^{}]+\}", text):
             name_m = re.search(r'"name"\s*:\s*"([^"]+)"', block)
             val_m = re.search(r'"value"\s*:\s*"([^"]*)"', block)
@@ -80,7 +77,6 @@ def parse_cookies(raw: Any) -> dict[str, str]:
                 if pair:
                     result[pair[0]] = pair[1]
 
-        # Формат Netscape cookies.txt: domain, flag, path, secure, expiry, name, value (через табуляцию)
         for line in text.splitlines():
             parts = line.rstrip("\n").split("\t")
             if len(parts) == 7 and _domain_ok(parts[0].replace("#HttpOnly_", "")):
@@ -88,7 +84,6 @@ def parse_cookies(raw: Any) -> dict[str, str]:
                 if pair:
                     result[pair[0]] = pair[1]
 
-        # Строка заголовка: "a=1; b=2"
         if not result and "{" not in text:
             for part in text.split(";"):
                 if "=" in part:
@@ -107,7 +102,6 @@ def parse_cookies(raw: Any) -> dict[str, str]:
         return dict(list(result.items())[:MAX_COOKIES])
 
     if isinstance(raw, dict):
-        # Либо {"name": "value"}, либо одиночный объект Cookie-Editor {"name": ..., "value": ...}
         if "name" in raw and "value" in raw and isinstance(raw.get("name"), str):
             if _domain_ok(raw.get("domain")):
                 pair = _clean_pair(raw["name"], raw["value"])
@@ -219,7 +213,7 @@ class AvitoMessenger:
 
         for proxies in get_proxy_candidates():
             try:
-                async with AsyncSession(impersonate="chrome124", proxies=proxies, timeout=20) as session:
+                async with create_browser_session(proxies, timeout=20) as session:
                     resp = await session.get("https://www.avito.ru/web/1/profile/short", cookies=cookies, headers=headers)
                     status = resp.status_code
                     if status == 200:
@@ -234,11 +228,17 @@ class AvitoMessenger:
                     elif status == 401:
                         return False, "Сессия устарела (HTTP 401). Войдите в Avito заново и обновите cookies."
 
-                    # Адрес проверки мог измениться: проверяем по странице профиля (без перехода по редиректам)
-                    page = await session.get("https://www.avito.ru/profile", cookies=cookies, headers={
-                        "Accept": "text/html,application/xhtml+xml",
-                        "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "same-origin",
-                    }, allow_redirects=False)
+                    page = await session.get(
+                        "https://www.avito.ru/profile",
+                        cookies=cookies,
+                        headers={
+                            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                            "Sec-Fetch-Dest": "document",
+                            "Sec-Fetch-Mode": "navigate",
+                            "Sec-Fetch-Site": "same-origin",
+                        },
+                        allow_redirects=False,
+                    )
                     if page.status_code == 200:
                         return True, "Сессия выглядит активной (проверено по странице профиля)."
                     if page.status_code in (301, 302, 303, 307, 308):
@@ -285,15 +285,14 @@ class AvitoMessenger:
         except ValueError:
             return SendOutcome(False, f"Некорректный ID объявления: {item_id}")
 
-        # Cookies отправляем только на avito.ru
         item_url = validate_avito_url(item_url) or f"https://www.avito.ru/items/{numeric_item_id}"
         headers = self._build_headers(item_url)
         last_err = ""
 
         for proxies in get_proxy_candidates():
-            text_stage = False  # True, как только начали отправку текста: после этого повтор опасен дублем
+            text_stage = False
             try:
-                async with AsyncSession(impersonate="chrome124", proxies=proxies, timeout=25) as session:
+                async with create_browser_session(proxies, timeout=25) as session:
                     # 1. Открываем карточку, как человек перед нажатием «Написать»
                     page_status: int | None = None
                     try:
@@ -301,7 +300,7 @@ class AvitoMessenger:
                             item_url,
                             cookies=cookies,
                             headers={
-                                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                                 "Referer": "https://www.avito.ru/",
                                 "Sec-Fetch-Dest": "document",
                                 "Sec-Fetch-Mode": "navigate",
@@ -322,7 +321,6 @@ class AvitoMessenger:
                         logger.warning("Avito send %s: страница объявления вернула %s", numeric_item_id, page_status)
                         return SendOutcome(False, f"Защита Avito ({page_status}): автоотклик остановлен для сохранения аккаунта.", security_alert=True)
 
-                    # Пауза 1.5–3 сек. как при чтении объявления человеком
                     await asyncio.sleep(random.uniform(1.5, 3.0))
 
                     # 2. Создаём чат по объявлению
@@ -348,7 +346,6 @@ class AvitoMessenger:
                                 break
 
                     if not channel_id:
-                        # Запасной путь: отправка одним запросом без отдельного создания чата
                         text_stage = True
                         d_resp = await session.post(
                             DIRECT_ENDPOINT.format(item_id=numeric_item_id),
@@ -365,9 +362,8 @@ class AvitoMessenger:
                         if d_resp.status_code == 429:
                             return SendOutcome(False, "Лимит запросов (HTTP 429). Пауза перед следующей отправкой.", rate_limited=True)
                         if d_resp.status_code >= 500:
-                            # Неизвестно, дошёл ли текст: повторять нельзя, чтобы не отправить дубль
                             return SendOutcome(False, f"Avito ответил ошибкой сервера (HTTP {d_resp.status_code}) при отправке. Повтор не делаю, чтобы не было дубля.")
-                        text_stage = False  # ответ 4xx: текст не принят, повтор безопасен
+                        text_stage = False
 
                     if not channel_id:
                         if last_status == 404:
@@ -375,7 +371,7 @@ class AvitoMessenger:
                         retry = bool(last_status and last_status >= 500)
                         return SendOutcome(False, f"Не удалось создать чат (HTTP {last_status or 'ERR'}).", retryable=retry)
 
-                    # 3. Отправляем текст. С этого момента повтор запрещён: сообщение могло дойти.
+                    # 3. Отправляем текст.
                     text_stage = True
                     for send_url in SEND_ENDPOINTS:
                         url = send_url.format(channel_id=channel_id)
@@ -405,7 +401,6 @@ class AvitoMessenger:
                 if is_proxy_error(last_err):
                     continue
                 logger.warning("Avito send %s: ошибка сети: %s", numeric_item_id, last_err[:200])
-                # Повтор безопасен, только если текст ещё не отправлялся
                 return SendOutcome(False, f"Ошибка сети при отправке: {last_err[:120]}", retryable=not text_stage)
 
         return SendOutcome(False, f"Ошибка сети при отправке: {last_err[:120]}", retryable=True)
