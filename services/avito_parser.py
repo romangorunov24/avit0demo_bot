@@ -78,8 +78,16 @@ def _extract_location(card) -> str:
     return "Не указано"
 
 
+def _create_session(proxies: dict | None) -> AsyncSession:
+    """Создаёт сессию с актуальным профилем Chrome и откатом на chrome124 для старых версий curl-cffi."""
+    try:
+        return AsyncSession(impersonate="chrome", proxies=proxies, timeout=25)
+    except Exception:
+        return AsyncSession(impersonate="chrome124", proxies=proxies, timeout=25)
+
+
 async def parse_avito_search(search_url: str, search_name: str = "", ignore_backoff: bool = False) -> list[dict]:
-    """Парсит выдачу с гостевым прогревом, автопереключением прокси и защитой от спам-запросов."""
+    """Парсит выдачу с гостевым прогревом, нативным отпечатком Chrome и защитой от спам-запросов."""
     global _BACKOFF_UNTIL
 
     now = time.time()
@@ -94,38 +102,34 @@ async def parse_avito_search(search_url: str, search_name: str = "", ignore_back
         return []
     url = _ensure_sorted_by_date(checked)
 
+    # Оставляем только Accept-Language, чтобы curl_cffi сам формировал нативные заголовки Chrome
     base_headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-User": "?1",
     }
 
     html = ""
     for proxies in get_proxy_candidates():
         try:
-            async with AsyncSession(impersonate="chrome124", proxies=proxies, timeout=25) as session:
+            async with _create_session(proxies) as session:
+                warm_ok = bool(_GUEST_COOKIES)
+
                 if not _GUEST_COOKIES:
-                    warm_headers = {**base_headers, "Sec-Fetch-Site": "none"}
-                    warm_resp = await session.get("https://www.avito.ru/", headers=warm_headers)
-                    if warm_resp.status_code in (403, 429):
-                        _BACKOFF_UNTIL = time.time() + 180
-                        logger.warning(
-                            "Avito вернул статус %s при прогреве (включена защитная пауза 3 мин.)",
+                    warm_resp = await session.get("https://www.avito.ru/", headers=base_headers)
+                    if warm_resp.status_code == 200:
+                        warm_ok = True
+                        await asyncio.sleep(random.uniform(1.5, 3.0))
+                    else:
+                        # Если главная вернула 403/429, не обрываем сразу — пробуем открыть сам поиск после паузы
+                        logger.info(
+                            "Главная Avito при прогреве вернула %s, пробуем прямой переход в поиск...",
                             warm_resp.status_code,
                         )
-                        return []
-                    await asyncio.sleep(random.uniform(1.2, 2.4))
+                        await asyncio.sleep(random.uniform(2.0, 3.5))
 
-                search_headers = {
-                    **base_headers,
-                    "Referer": "https://www.avito.ru/",
-                    "Sec-Fetch-Site": "same-origin",
-                }
+                search_headers = dict(base_headers)
+                if warm_ok:
+                    search_headers["Referer"] = "https://www.avito.ru/"
+
                 resp = await session.get(url, headers=search_headers, cookies=_GUEST_COOKIES)
 
                 if resp.status_code in (403, 429):
@@ -169,7 +173,10 @@ async def parse_avito_search(search_url: str, search_name: str = "", ignore_back
         if _looks_blocked(html):
             _BACKOFF_UNTIL = time.time() + 180
             _GUEST_COOKIES.clear()
-            logger.warning("Avito показал страницу защиты/капчу для '%s' (пауза парсера 3 мин.). Проверьте IP/прокси.", search_name or url)
+            logger.warning(
+                "Avito показал страницу защиты/капчу для '%s' (пауза парсера 3 мин.). Проверьте IP/прокси.",
+                search_name or url,
+            )
         else:
             logger.warning(
                 "В выдаче '%s' не найдено карточек (страница %d байт). Поиск пуст или Авито изменил разметку.",
@@ -194,7 +201,6 @@ async def parse_avito_search(search_url: str, search_name: str = "", ignore_back
             item_url = href
         else:
             item_url = ""
-        # Ссылка лота обязана вести на avito.ru: с ней потом работают кнопка и отправка с cookies
         item_url = validate_avito_url(item_url) or f"https://www.avito.ru/items/{item_id}"
 
         price_val: int | None = None
